@@ -92,6 +92,71 @@ DEDUST_POLL_LIMIT = int(os.getenv("DEDUST_POLL_LIMIT", "50"))
 DEDUST_DEBUG = os.getenv("DEDUST_DEBUG", "0") == "1"
 DEDUST_API_BASE = os.getenv("DEDUST_API_BASE", "https://api.dedust.io").rstrip("/")
 
+def fetch_dedust_pool_stats(pool_addr: str) -> Dict[str, Any]:
+    """Best-effort DeDust pool stats fetch.
+    Returns keys: liquidity_usd, marketcap_usd, price_usd (if available).
+    Safe to call even if the endpoint/fields differ; it will just return {}.
+    """
+    if not pool_addr:
+        return {}
+    url_candidates = [
+        f"{DEDUST_API_BASE}/v2/pools/{pool_addr}",
+        f"{DEDUST_API_BASE}/v2/pools/{pool_addr}/stats",
+        f"{DEDUST_API_BASE}/v1/pools/{pool_addr}",
+    ]
+    headers = {"accept": "application/json"}
+    for url in url_candidates:
+        try:
+            r = requests.get(url, headers=headers, timeout=12)
+            if r.status_code != 200:
+                continue
+            data = r.json() or {}
+            # try to discover fields
+            flat = data
+            # sometimes the payload wraps actual object
+            for k in ("pool", "data", "result"):
+                if isinstance(flat, dict) and isinstance(flat.get(k), dict):
+                    flat = flat[k]
+                    break
+
+            def pick_usd(obj: Any) -> Optional[float]:
+                if obj is None:
+                    return None
+                if isinstance(obj, (int, float)):
+                    return float(obj)
+                if isinstance(obj, dict):
+                    for kk in ("usd", "USD", "value_usd", "tvl_usd", "liquidity_usd"):
+                        v = obj.get(kk)
+                        if isinstance(v, (int, float)):
+                            return float(v)
+                return None
+
+            liquidity = None
+            for key in ("liquidity", "tvl", "tvlUsd", "liquidityUsd", "liquidity_usd", "tvl_usd"):
+                v = flat.get(key) if isinstance(flat, dict) else None
+                liquidity = pick_usd(v) or liquidity
+            marketcap = None
+            for key in ("marketCap", "marketcap", "mcap", "fdv", "fullyDilutedValuation", "fdvUsd", "marketcap_usd"):
+                v = flat.get(key) if isinstance(flat, dict) else None
+                marketcap = pick_usd(v) or (float(v) if isinstance(v, (int, float)) else marketcap)
+            price = None
+            for key in ("price", "priceUsd", "price_usd", "tokenPriceUsd", "token_price_usd"):
+                v = flat.get(key) if isinstance(flat, dict) else None
+                price = pick_usd(v) or (float(v) if isinstance(v, (int, float)) else price)
+
+            out: Dict[str, Any] = {}
+            if liquidity is not None:
+                out["liquidity_usd"] = liquidity
+            if marketcap is not None:
+                out["marketcap_usd"] = marketcap
+            if price is not None:
+                out["price_usd"] = price
+            if out:
+                return out
+        except Exception:
+            continue
+    return {}
+
 # Poll intervals (seconds)
 STON_POLL_INTERVAL = int(os.getenv("STON_POLL_INTERVAL", "2"))
 DEDUST_POLL_INTERVAL = int(os.getenv("DEDUST_POLL_INTERVAL", "3"))
@@ -367,11 +432,41 @@ def _get_any(t: Dict[str, Any], keys: List[str], default: str = "") -> str:
     return default
 
 def _trade_cursor_id(t: Dict[str, Any]) -> str:
-    """Prefer stable trade id/lt for cursor to avoid missing same-second trades."""
-    return _get_any(t, ["id", "trade_id", "tradeId", "event_id", "eventId", "seqno", "tx_lt", "lt"], "") or _get_any(
-        t, ["txHash", "tx_hash", "hash", "transactionHash"], ""
-    )
+    """Return a stable, unique-ish cursor id for a trade.
 
+    Different APIs/feeds use different keys. We try common ids first.
+    If none exist, we fall back to a synthetic id derived from timestamp + tx hash + a few fields.
+    """
+    # 1) real ids
+    cid = _get_any(
+        t,
+        ["id", "trade_id", "tradeId", "event_id", "eventId", "seqno", "tx_lt", "lt"],
+        "",
+    )
+    if cid:
+        return str(cid)
+
+    # 2) tx hash
+    txh = _get_any(t, ["txHash", "tx_hash", "hash", "transaction_hash", "transactionHash"], "")
+    if txh:
+        return str(txh)
+
+    # 3) timestamp-based synthetic cursor (still stable across polls)
+    ts = _get_any(t, ["created_at", "createdAt", "time", "timestamp", "ts"], "")
+    # include a few fields that typically change per trade
+    a1 = _get_any(t, ["amount_in", "amountIn", "in_amount", "inAmount", "amount"], "")
+    a2 = _get_any(t, ["amount_out", "amountOut", "out_amount", "outAmount"], "")
+    u = _get_any(t, ["user", "sender", "wallet", "address", "trader"], "")
+    synthetic = f"{ts}|{a1}|{a2}|{u}"
+    synthetic = synthetic.strip("|")
+    if synthetic:
+        return synthetic
+
+    # 4) absolute last resort: stable hash of json (best effort)
+    try:
+        return str(hash(json.dumps(t, sort_keys=True, separators=(",", ":"))))
+    except Exception:
+        return ""
 def _trade_tx_hash(t: Dict[str, Any]) -> str:
     """Extract tx hash from various DeDust trade shapes."""
     if isinstance(t, dict) and isinstance(t.get("transaction"), dict):
@@ -714,6 +809,22 @@ def fetch_pair_stats(pair_id: str) -> Dict[str, Any]:
 TOKEN_STATS_CACHE: Dict[str, Dict[str, Any]] = {}
 
 def fetch_token_stats(token_addr: str) -> Dict[str, Any]:
+
+        # DeDust pools are not always indexed on DexScreener yet.
+        # Best-effort: fetch pool stats from DeDust API to populate Liquidity/MarketCap if missing.
+        if (source_label or "").lower() == "dedust":
+            try:
+                pool_stats = fetch_dedust_pool_stats(pair_id)
+                if pool_stats:
+                    # only fill missing
+                    if stats.get("liquidity_usd") is None and pool_stats.get("liquidity_usd") is not None:
+                        stats["liquidity_usd"] = pool_stats["liquidity_usd"]
+                    if stats.get("marketcap_usd") is None and pool_stats.get("marketcap_usd") is not None:
+                        stats["marketcap_usd"] = pool_stats["marketcap_usd"]
+                    if stats.get("price_usd") is None and pool_stats.get("price_usd") is not None:
+                        stats["price_usd"] = pool_stats["price_usd"]
+            except Exception:
+                pass
     """Fallback stats using DexScreener token endpoint.
 
     Returns liquidity_usd and marketcap_usd derived from the best TON pair for this token.
@@ -2907,6 +3018,15 @@ async def dedust_tracker_job(context: ContextTypes.DEFAULT_TYPE):
             last_id = str(last_id_map.get(pool, "") or "").strip()
             trades = trades_by_pool.get(pool) or []
             if not trades:
+                continue
+
+            # If we have no cursor yet for this pool (fresh deploy / wiped state),
+            # initialize cursor to the newest trade and DO NOT post historical trades.
+            if not last_id:
+                newest_tid = _trade_cursor_id(trades[0]) if trades else ""
+                if newest_tid:
+                    last_id_map[pool] = newest_tid
+                    _save_state(state)
                 continue
 
             
