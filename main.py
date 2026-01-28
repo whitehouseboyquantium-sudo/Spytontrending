@@ -7,12 +7,16 @@ import base64
 import re
 import threading
 import requests
+import logging
 from urllib.parse import urlparse, parse_qs
 from typing import Any, Dict, Optional, List, Tuple
 
 from flask import Flask
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
+
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger("spyton")
 
 # ============================================================
 # SpyTON Detector
@@ -3061,6 +3065,9 @@ def main():
             bot.add_handler(CommandHandler("listpairs", listpairs))
             bot.add_handler(CommandHandler("setleaderboard", setleaderboard))
             bot.add_handler(CommandHandler("status", status))
+
+            if bot.job_queue is None:
+                raise RuntimeError("JobQueue is not available. Ensure requirements include python-telegram-bot[job-queue]==20.7")
 
             # Warm TON price cache (so posts are instant)
             bot.job_queue.run_repeating(ton_price_cache_job, interval=60, first=1)
