@@ -1655,10 +1655,7 @@ def build_strength_bar(ton_amt: float) -> str:
         lines.append(icon * min(per_line, filled - i))
 
     # Extra blank line after the wall so the TON line isn't too close.
-    return "
-".join(lines) + "
-
-"
+    return "\n".join(lines) + "\n\n"
 # ===================== MESSAGE SENDER =====================
 async def post_buy_message(
     context: ContextTypes.DEFAULT_TYPE,
