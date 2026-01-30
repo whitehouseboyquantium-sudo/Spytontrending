@@ -1699,7 +1699,8 @@ async def post_buy_message(
         holders_line = f"👥 Holders: <b>{holders_count}</b>\n" if isinstance(holders_count, int) else ""
 
         dex_label = (lbl or source_label or "DEX").strip() or "DEX"
-        title = f"<b>{sym} Buy! — {dex_label}</b>" if dex_label else f"<b>{sym} Buy!</b>"
+        token_disp = f"<a href='{tg_url}'>{sym}</a>" if tg_url else sym
+        title = f"<b>{token_disp} Buy! — {dex_label}</b>" if dex_label else f"<b>{token_disp} Buy!</b>"
 
         # Premium Version 1 layout (used for STON.fi + DeDust)
         ton_line = f"💎 <b>{ton_amt:.2f} TON</b>{usd_part}\n" if ton_amt > 0 else ""
