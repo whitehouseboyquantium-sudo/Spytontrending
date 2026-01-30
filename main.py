@@ -6,6 +6,7 @@ import asyncio
 import base64
 import re
 import threading
+import logging
 import requests
 from urllib.parse import urlparse, parse_qs
 from typing import Any, Dict, Optional, List, Tuple
@@ -13,6 +14,13 @@ from typing import Any, Dict, Optional, List, Tuple
 from flask import Flask
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
+
+# -------------------- LOGGING --------------------
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO").upper(),
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+)
+log = logging.getLogger("spyton")
 
 # ============================================================
 # SpyTON Detector
@@ -3118,6 +3126,15 @@ def main():
             load_state()
 
             bot = ApplicationBuilder().token(BOT_TOKEN).build()
+
+            # Railway note: Application.job_queue is only available when
+            # python-telegram-bot is installed with the [job-queue] extra.
+            if bot.job_queue is None:
+                raise RuntimeError(
+                    "JobQueue is not available (bot.job_queue is None). "
+                    "Fix: set requirements to python-telegram-bot[job-queue]==20.7 "
+                    "so APScheduler is installed."
+                )
 
             bot.add_handler(CommandHandler("start", start))
             bot.add_handler(CommandHandler("addtoken", addtoken))
