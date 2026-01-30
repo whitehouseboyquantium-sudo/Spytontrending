@@ -68,7 +68,7 @@ if "spytontrendbot" in _bt_low or "spytontrndbot" in _bt_low:
 else:
     BOOK_TRENDING_URL = _bt
 
-HEADER_IMAGE_PATH = os.getenv("HEADER_IMAGE_PATH", "")  # set env to enable header image
+HEADER_IMAGE_PATH = os.getenv("HEADER_IMAGE_PATH", "header.png")
 
 # -------------------- CUSTOM EMOJI (OPTIONAL) --------------------
 # Put numeric Telegram custom_emoji_id values in Replit Secrets.
@@ -1621,44 +1621,44 @@ def tg_emoji(emoji_id: str, fallback: str) -> str:
     return f"<tg-emoji emoji-id=\"{emoji_id}\">{fallback}</tg-emoji>"
 
 def strength_count_from_ton(ton_amt: float) -> int:
-    """Map TON amount to a premium strength wall size (compact).
+    """Map TON amount to a wider premium strength wall.
 
-    - 12 symbols per line
-    - Usually 1–2 lines, 3 lines only for whales
-    - Hard cap at 36 symbols so alerts don't get too big
+    Goal: make the Telegram message bubble "expand" (wider), like premium trackers.
+
+    - 20 symbols per line (wider)
+    - Max 3 lines
+    - Still capped so it doesn't become ridiculous
     """
     try:
         t = float(ton_amt or 0.0)
     except Exception:
         t = 0.0
 
-    # Compact tiers (keeps template premium but not massive)
+    # Wide tiers (forces at least 1 full 20-wide line)
     if t < 2:
-        return 12          # 1 line
+        return 20          # 1 full line
     if t < 10:
-        return 24          # 2 lines
+        return 40          # 2 full lines
     if t < 25:
-        return 30          # 2.5 lines (2 lines + 6)
-    return 36              # 3 lines (cap)
+        return 50          # 2.5 lines (2 lines + 10)
+    return 60              # 3 full lines (cap)
 
 
 def build_strength_bar(ton_amt: float) -> str:
-    """Return a premium strength wall using the ꘜ symbol."""
+    """Return a premium strength wall using the ꘜ symbol (wide)."""
     filled = strength_count_from_ton(ton_amt)
     icon = "ꘜ"
-    icons = [icon] * filled
 
+    per_line = 20
     lines = []
-    per_line = 12
-    for i in range(0, len(icons), per_line):
-        chunk = icons[i:i + per_line]
-        if chunk:
-            lines.append("".join(chunk))
+    for i in range(0, filled, per_line):
+        lines.append(icon * min(per_line, filled - i))
 
-    # Add an extra blank line after the wall so the TON line isn't too close.
-    wall = "\n".join(lines)
-    return (wall + "\n\n") if wall else ""
+    # Extra blank line after the wall so the TON line isn't too close.
+    return "
+".join(lines) + "
 
+"
 # ===================== MESSAGE SENDER =====================
 async def post_buy_message(
     context: ContextTypes.DEFAULT_TYPE,
