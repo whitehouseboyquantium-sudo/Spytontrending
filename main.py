@@ -1623,33 +1623,39 @@ def tg_emoji(emoji_id: str, fallback: str) -> str:
 def strength_count_from_ton(ton_amt: float) -> int:
     """Map TON amount to a premium emoji wall size.
 
-    We render up to 4 lines (14 icons per line => max 56 icons).
-    Ensures at least one full line so the alert always looks 'premium'.
+    We render up to 3 lines (12 icons per line => max 36 icons).
+    Ensures at least one full line so the alert always looks premium
+    without making the template too big.
     """
     try:
         t = float(ton_amt or 0.0)
     except Exception:
         t = 0.0
 
-    # Tuned so: 20 TON -> 44 icons (matches the example style)
-    count = int(t * 2) + 4
-    return max(14, min(56, count))
+    # Reduced sizing (template was becoming too big)
+    # Examples:
+    #  - ~10 TON  -> ~18 icons (2 lines)
+    #  - ~20 TON  -> ~30 icons (3 lines)
+    #  -  25+ TON -> capped
+    count = int(t * 1.2) + 6
+    return max(12, min(36, count))
 
 
 def build_strength_bar(ton_amt: float) -> str:
-    """Return a green-circle emoji wall (up to 4 lines)."""
+    """Return a green-circle emoji wall (up to 3 lines)."""
     filled = strength_count_from_ton(ton_amt)
     icon = tg_emoji(SPY_CUSTOM_EMOJI_ID, "🟢")
     icons = [icon] * filled
 
     lines = []
-    per_line = 14
+    per_line = 12
     for i in range(0, len(icons), per_line):
         chunk = icons[i:i+per_line]
         if chunk:
             lines.append("".join(chunk))
 
-    return "\n".join(lines) + "\n"
+    # Add an extra blank line after the wall so the TON line isn't too close.
+    return "\n".join(lines) + "\n\n"
 
 # ===================== MESSAGE SENDER =====================
 async def post_buy_message(
@@ -1718,8 +1724,7 @@ async def post_buy_message(
             f"📊 MCap: <b>{mc_txt}</b>\n\n"
             f"📈 <a href='{chart_url}'>Chart</a> | "
             f"🔥 <a href='{TRENDING_URL}'>Trending</a> | "
-            f"🆕 <a href='{pools_url}'>Pools</a>\n"
-            f"🚀 Book Trending"
+            f"🆕 <a href='{pools_url}'>Pools</a>"
         )
 
 # GROUP STYLE (exact template user wants)
