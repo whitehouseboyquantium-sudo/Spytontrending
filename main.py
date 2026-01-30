@@ -1621,21 +1621,35 @@ def tg_emoji(emoji_id: str, fallback: str) -> str:
     return f"<tg-emoji emoji-id=\"{emoji_id}\">{fallback}</tg-emoji>"
 
 def strength_count_from_ton(ton_amt: float) -> int:
-    # Map TON amount to 1..28 strength icons.
+    """Map TON amount to a premium emoji wall size.
+
+    We render up to 4 lines (14 icons per line => max 56 icons).
+    Ensures at least one full line so the alert always looks 'premium'.
+    """
     try:
         t = float(ton_amt or 0.0)
     except Exception:
         t = 0.0
-    return max(1, min(28, int(t // 2) + 1))
+
+    # Tuned so: 20 TON -> 44 icons (matches the example style)
+    count = int(t * 2) + 4
+    return max(14, min(56, count))
+
 
 def build_strength_bar(ton_amt: float) -> str:
-    # Two-line strength bar (up to 28 icons). No empty squares.
+    """Return a green-circle emoji wall (up to 4 lines)."""
     filled = strength_count_from_ton(ton_amt)
     icon = tg_emoji(SPY_CUSTOM_EMOJI_ID, "🟢")
     icons = [icon] * filled
-    line1 = "".join(icons[:14])
-    line2 = "".join(icons[14:28])
-    return f"{line1}\n{line2}\n" if line2 else f"{line1}\n"
+
+    lines = []
+    per_line = 14
+    for i in range(0, len(icons), per_line):
+        chunk = icons[i:i+per_line]
+        if chunk:
+            lines.append("".join(chunk))
+
+    return "\n".join(lines) + "\n"
 
 # ===================== MESSAGE SENDER =====================
 async def post_buy_message(
@@ -1676,51 +1690,39 @@ async def post_buy_message(
         mc_txt = money_fmt(stats.get("marketcap_usd"))
         liq_txt = money_fmt(stats.get("liquidity_usd"))
 
-        holders_line = f"{tg_emoji(ICON_HOLDERS_ID, '👥')} Holders <b>{holders_count}</b>\n" if isinstance(holders_count, int) else ""
+        holders_line = f"👥 Holders: <b>{holders_count}</b>\n" if isinstance(holders_count, int) else ""
 
-        title_core = f"{badge} {sym} Buy!"
-        if lbl:
-            title_core = f"{badge} {sym} Buy! — {lbl}"
-        title = f"<a href='{tg_url}'><b>{title_core}</b></a>" if tg_url else f"<b>{title_core}</b>"
+        dex_label = (lbl or source_label or "DEX").strip() or "DEX"
+        title = f"<b>{sym} Buy! — {dex_label}</b>" if dex_label else f"<b>{sym} Buy!</b>"
 
-        ton_line = f"{tg_emoji(ICON_SWAP_ID, '🔁')} <b>{ton_amt:.2f} TON</b>{usd_part}\n" if ton_amt > 0 else ""
-        token_line = f"{tg_emoji(ICON_SWAP_ID, '🔁')} <b>{token_amt:,.6f} {sym}</b>\n" if token_amt > 0 else ""
+        # Premium Version 1 layout (used for STON.fi + DeDust)
+        ton_line = f"💎 <b>{ton_amt:.2f} TON</b>{usd_part}\n" if ton_amt > 0 else ""
+        token_line = f"🪙 <b>{token_amt:,.2f} {sym}</b>\n" if token_amt > 0 else ""
 
-        forced_rank = get_forced_rank(sym)
-        auto_rank = get_auto_rank(sym)
-        show_rank = forced_rank or auto_rank
-        trend_rank_line = (f"\n\n🟢 <b>#{show_rank}</b> On <a href='{TRENDING_URL}'>SpyTON Trending</a>" if show_rank else "")
+        if tx_url:
+            if buyer_url:
+                wallet_line = f"👤 <a href='{buyer_url}'>{short(buyer)}</a> | <a href='{tx_url}'>Txn</a>\n"
+            else:
+                wallet_line = f"👤 {short(buyer)} | <a href='{tx_url}'>Txn</a>\n"
+        else:
+            wallet_line = f"👤 {short(buyer)} | Txn\n"
 
         text = (
-            f"{title}\n"
-            f"{build_strength_bar(ton_amt)}\n"
+            f"{title}\n\n"
+            f"{build_strength_bar(ton_amt)}"
             f"{ton_line}"
-            f"{token_line}"
-            f"{tg_emoji(ICON_WALLET_ID, '👤')} <a href='{buyer_url}'>{short(buyer)}</a> | {tg_emoji(ICON_TXN_ID, '🔗')} <a href='{tx_url}'>Txn</a>\n"
-            f"{tg_emoji(ICON_POS_ID, '⬆️')} Position: <b>{pos_txt}</b>\n"
+            f"{token_line}\n"
+            f"{wallet_line}\n"
             f"{holders_line}"
+            f"💧 Liquidity: <b>{liq_txt}</b>\n"
+            f"📊 MCap: <b>{mc_txt}</b>\n\n"
+            f"📈 <a href='{chart_url}'>Chart</a> | "
+            f"🔥 <a href='{TRENDING_URL}'>Trending</a> | "
+            f"🆕 <a href='{pools_url}'>Pools</a>\n"
+            f"🚀 Book Trending"
         )
 
-        is_blum = (source_label or "").strip().lower() == "blum"
-        if not is_blum:
-            text += (
-                f"{tg_emoji(ICON_MCAP_ID, '💸')} Market Cap <b>{mc_txt}</b>\n"
-                f"{tg_emoji(ICON_LIQ_ID, '🌊')} Liquidity <b>{liq_txt}</b>\n\n"
-                f"{tg_emoji(ICON_PIN_ID, '📌')} <a href='{LISTING_URL}'>Ton Listing</a>\n"
-                f"{tg_emoji(ICON_CHART_ID, '📊')} <a href='{chart_url}'>Chart</a> | "
-                f"{tg_emoji(ICON_TREND_ID, '🔥')} <a href='{TRENDING_URL}'>Trending</a> | "
-                f"{tg_emoji(ICON_POOLS_ID, '🆕')} <a href='{pools_url}'>Pools</a>"
-            )
-        else:
-            text += (
-                f"\n{tg_emoji(ICON_PIN_ID, '📌')} <a href='{LISTING_URL}'>Ton Listing</a>\n"
-                f"{tg_emoji(ICON_CHART_ID, '📊')} <a href='{chart_url}'>Chart</a> | "
-                f"{tg_emoji(ICON_TREND_ID, '🔥')} <a href='{TRENDING_URL}'>Trending</a>"
-            )
-
-        text += trend_rank_line
-
-        # GROUP STYLE (exact template user wants)
+# GROUP STYLE (exact template user wants)
         dex_lbl_plain = (lbl or source_label or "DEX").strip() or "DEX"
         grp_pos = "New!" if "new" in (pos_txt or "").lower() else "Old!"
         price_val = stats.get("price_usd")
