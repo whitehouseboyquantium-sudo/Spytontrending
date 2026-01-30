@@ -68,7 +68,7 @@ if "spytontrendbot" in _bt_low or "spytontrndbot" in _bt_low:
 else:
     BOOK_TRENDING_URL = _bt
 
-HEADER_IMAGE_PATH = os.getenv("HEADER_IMAGE_PATH", "header.png")
+HEADER_IMAGE_PATH = os.getenv("HEADER_IMAGE_PATH", "")  # set env to enable header image
 
 # -------------------- CUSTOM EMOJI (OPTIONAL) --------------------
 # Put numeric Telegram custom_emoji_id values in Replit Secrets.
@@ -1621,41 +1621,43 @@ def tg_emoji(emoji_id: str, fallback: str) -> str:
     return f"<tg-emoji emoji-id=\"{emoji_id}\">{fallback}</tg-emoji>"
 
 def strength_count_from_ton(ton_amt: float) -> int:
-    """Map TON amount to a premium emoji wall size.
+    """Map TON amount to a premium strength wall size (compact).
 
-    We render up to 3 lines (12 icons per line => max 36 icons).
-    Ensures at least one full line so the alert always looks premium
-    without making the template too big.
+    - 12 symbols per line
+    - Usually 1–2 lines, 3 lines only for whales
+    - Hard cap at 36 symbols so alerts don't get too big
     """
     try:
         t = float(ton_amt or 0.0)
     except Exception:
         t = 0.0
 
-    # Reduced sizing (template was becoming too big)
-    # Examples:
-    #  - ~10 TON  -> ~18 icons (2 lines)
-    #  - ~20 TON  -> ~30 icons (3 lines)
-    #  -  25+ TON -> capped
-    count = int(t * 1.2) + 6
-    return max(12, min(36, count))
+    # Compact tiers (keeps template premium but not massive)
+    if t < 2:
+        return 12          # 1 line
+    if t < 10:
+        return 24          # 2 lines
+    if t < 25:
+        return 30          # 2.5 lines (2 lines + 6)
+    return 36              # 3 lines (cap)
 
 
 def build_strength_bar(ton_amt: float) -> str:
-    """Return a green-circle emoji wall (up to 3 lines)."""
+    """Return a premium strength wall using the ꘜ symbol."""
     filled = strength_count_from_ton(ton_amt)
-    icon = tg_emoji(SPY_CUSTOM_EMOJI_ID, "🟢")
+    icon = "ꘜ"
     icons = [icon] * filled
 
     lines = []
     per_line = 12
     for i in range(0, len(icons), per_line):
-        chunk = icons[i:i+per_line]
+        chunk = icons[i:i + per_line]
         if chunk:
             lines.append("".join(chunk))
 
     # Add an extra blank line after the wall so the TON line isn't too close.
-    return "\n".join(lines) + "\n\n"
+    wall = "\n".join(lines)
+    return (wall + "\n\n") if wall else ""
 
 # ===================== MESSAGE SENDER =====================
 async def post_buy_message(
@@ -1696,10 +1698,12 @@ async def post_buy_message(
         mc_txt = money_fmt(stats.get("marketcap_usd"))
         liq_txt = money_fmt(stats.get("liquidity_usd"))
 
-        holders_line = f"👥 Holders: <b>{holders_count}</b>\n" if isinstance(holders_count, int) else ""
+        holders_val = f"{holders_count:,}" if isinstance(holders_count, int) else "N/A"
+        holders_line = f"👥 Holders: <b>{holders_val}</b>\n"
 
         dex_label = (lbl or source_label or "DEX").strip() or "DEX"
-        title = f"<b>{sym} Buy! — {dex_label}</b>" if dex_label else f"<b>{sym} Buy!</b>"
+        token_disp = f"<a href='{tg_url}'>{sym}</a>" if tg_url else sym
+        title = f"<b>{token_disp} Buy! — {dex_label}</b>" if dex_label else f"<b>{token_disp} Buy!</b>"
 
         # Premium Version 1 layout (used for STON.fi + DeDust)
         ton_line = f"💎 <b>{ton_amt:.2f} TON</b>{usd_part}\n" if ton_amt > 0 else ""
