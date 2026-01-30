@@ -279,19 +279,23 @@ def short(addr: str) -> str:
     return addr[:4] + "…" + addr[-4:]
 
 
-def _to_hex_tx_hash(h: str) -> str:
+def _to_hex_tx_hash(h: Any) -> str:
     """Normalize TON tx hash into 64-char hex if possible.
 
     Accepts:
       - 64-char hex (optionally prefixed with 0x)
       - base64 / base64url (with or without padding) representing 32 bytes
+      - list/tuple of ints (32 bytes)
+      - dicts containing hash fields
     Returns empty string if cannot parse.
     """
     if h is None:
         return ""
+
     # Sometimes callers pass dicts/lists by mistake
     if isinstance(h, dict):
-        h = h.get("hash") or h.get("tx_hash") or h.get("txHash") or ""
+        h = h.get("hash") or h.get("tx_hash") or h.get("txHash") or h.get("transactionHash") or ""
+
     if isinstance(h, (list, tuple)) and all(isinstance(x, int) for x in h):
         try:
             b = bytes(h)
@@ -299,35 +303,22 @@ def _to_hex_tx_hash(h: str) -> str:
                 return b.hex()
         except Exception:
             return ""
-    h = str(h).strip()
-    if not h:
+
+    s = str(h).strip()
+    if not s:
         return ""
-    if h.startswith("0x") and len(h) == 66:
-        h = h[2:]
 
-    if re.fullmatch(r"[0-9a-fA-F]{64}", h):
-        return h.lower()
+    if s.startswith("0x") and len(s) == 66:
+        s = s[2:]
 
-    # Try base64url/base64 decode -> 32 bytes -> hex
-    try:
-        s = h.replace("-", "+").replace("_", "/")
-        pad = "=" * ((4 - (len(s) % 4)) % 4)
-        raw = base64.b64decode(s + pad)
-        if len(raw) == 32:
-            return raw.hex()
-    except Exception:
-        pass
-
-    return ""
-    h = str(h).strip()
-    if re.fullmatch(r"[0-9a-fA-F]{64}", h):
-        return h.lower()
+    if re.fullmatch(r"[0-9a-fA-F]{64}", s):
+        return s.lower()
 
     # Try base64url/base64 decode -> 32 bytes -> hex
     try:
-        s = h.replace("-", "+").replace("_", "/")
-        pad = "=" * ((4 - (len(s) % 4)) % 4)
-        raw = base64.b64decode(s + pad)
+        b64 = s.replace("-", "+").replace("_", "/")
+        pad = "=" * ((4 - (len(b64) % 4)) % 4)
+        raw = base64.b64decode(b64 + pad)
         if len(raw) == 32:
             return raw.hex()
     except Exception:
@@ -375,6 +366,32 @@ def _trade_tx_hash(t: Dict[str, Any]) -> str:
         if hv:
             return hv
     return _get_any(t, ["tx_hash", "txHash", "hash", "transactionHash", "txHashHex", "tx_hash_hex", "txhash", "txHash64"], "")
+def _trade_lt_int(t: Dict[str, Any]) -> int:
+    """Extract DeDust trade logical time (lt) if present (best-effort)."""
+    if not isinstance(t, dict):
+        return 0
+
+    def _as_int(x: Any) -> int:
+        if isinstance(x, int):
+            return x
+        if isinstance(x, str) and x.isdigit():
+            return int(x)
+        return 0
+
+    for k in ("lt", "tx_lt", "txLt", "logical_time", "logicalTime"):
+        v = _as_int(t.get(k))
+        if v:
+            return v
+
+    tx = t.get("transaction")
+    if isinstance(tx, dict):
+        for k in ("lt", "tx_lt", "txLt"):
+            v = _as_int(tx.get(k))
+            if v:
+                return v
+
+    return 0
+
 def file_exists(path: str) -> bool:
     try:
         return os.path.isfile(path)
@@ -1002,15 +1019,24 @@ def get_jetton_decimals(jetton_master: str) -> int:
     return dec
 
 
-def dedust_fetch_trades(pool_addr: str, limit: int = 25) -> List[Dict[str, Any]]:
+def dedust_fetch_trades(pool_addr: str, limit: int = 25, after_lt: int = 0) -> List[Dict[str, Any]]:
     """Fetch recent trades for a DeDust pool.
-    Uses api.dedust.io (public). Response schema can change; parsing is tolerant.
+
+    Uses api.dedust.io (public). Prefer cursor-based polling using after_lt
+    to avoid reposting old trades. If the endpoint ignores after_lt, caller
+    will still de-dup by lt/hash.
     """
     if not pool_addr:
         return []
     url = f"{DEDUST_API_BASE}/v2/pools/{pool_addr}/trades"
+    params: Dict[str, Any] = {}
+    if limit:
+        params["page_size"] = int(limit)
+        params["limit"] = int(limit)
+    if after_lt:
+        params["after_lt"] = int(after_lt)
     try:
-        res = requests.get(url, params={"limit": limit}, timeout=20)
+        res = requests.get(url, params=params, timeout=20)
         if res.status_code != 200:
             return []
         js = res.json()
@@ -1020,7 +1046,7 @@ def dedust_fetch_trades(pool_addr: str, limit: int = 25) -> List[Dict[str, Any]]
             arr = js.get("trades") or js.get("items") or js.get("data")
             if isinstance(arr, list):
                 return [t for t in arr if isinstance(t, dict)]
-    except:
+    except Exception:
         pass
     return []
 
@@ -2848,9 +2874,9 @@ async def dedust_tracker_job(context: ContextTypes.DEFAULT_TYPE):
     """Poll DeDust trades via the public DeDust API and post BUY-ONLY swaps.
 
     Fixes:
-    - No more cursor based only on timestamp (multiple trades can share the same second -> missed buys)
-    - Uses last seen trade id/hash per pool
-    - Network calls run in a thread (requests won't block the asyncio loop -> less lag)
+    - Stops reposting old trades by using a per-pool cursor (after_lt) persisted in state.json
+    - Still de-dups in-memory by trade cursor/hash to protect against endpoint quirks
+    - Keeps network I/O off the asyncio loop (requests runs in a thread)
     """
     if not DEDUST_ENABLED:
         return
@@ -2859,23 +2885,26 @@ async def dedust_tracker_job(context: ContextTypes.DEFAULT_TYPE):
         load_data()
         load_state()
 
-        last_id_map = STATE.get("dedust_last_id")
+        # Persistent cursors (survive Railway restarts)
+        last_id_map = STATE.setdefault('dedust_last_id', {})
         if not isinstance(last_id_map, dict):
             last_id_map = {}
-            STATE["dedust_last_id"] = last_id_map
+            STATE['dedust_last_id'] = last_id_map
 
-        # keep legacy key present but unused
-        STATE.setdefault("dedust_last_lt", {})
+        last_lt_map = STATE.setdefault('dedust_last_lt', {})
+        if not isinstance(last_lt_map, dict):
+            last_lt_map = {}
+            STATE['dedust_last_lt'] = last_lt_map
 
-        # Collect pools first so we can fetch in parallel (prevents multi-minute loops)
+        # Collect pools first so we can fetch in parallel
         pools: List[Tuple[str, Dict[str, Any], str, str]] = []  # (pool, rec, sym, token_addr)
-        for pool, rec in DATA.get("pairs", {}).items():
+        for pool, rec in DATA.get('pairs', {}).items():
             if not isinstance(rec, dict):
                 continue
-            if str(rec.get("dex", "")).lower() != "dedust":
+            if str(rec.get('dex', '')).lower() != 'dedust':
                 continue
-            sym = (rec.get("symbol") or "?").strip().upper()
-            token_addr = (rec.get("token_address") or "").strip()
+            sym = (rec.get('symbol') or '?').strip().upper()
+            token_addr = (rec.get('token_address') or '').strip()
             if not token_addr:
                 continue
             pools.append((pool, rec, sym, token_addr))
@@ -2883,59 +2912,99 @@ async def dedust_tracker_job(context: ContextTypes.DEFAULT_TYPE):
         if not pools:
             return
 
-        sem = asyncio.Semaphore(int(os.getenv("DEDUST_CONCURRENCY", "16")))
+        sem = asyncio.Semaphore(int(os.getenv('DEDUST_CONCURRENCY', '16')))
 
         async def _fetch_pool(pool_addr: str):
             async with sem:
-                trades = await _to_thread(dedust_fetch_trades, pool_addr, DEDUST_POLL_LIMIT)
-                return pool_addr, trades
+                try:
+                    after_lt = int(last_lt_map.get(pool_addr, 0) or 0)
+                except Exception:
+                    after_lt = 0
+                trades = await _to_thread(dedust_fetch_trades, pool_addr, DEDUST_POLL_LIMIT, after_lt)
+                return pool_addr, after_lt, trades
 
         results = await asyncio.gather(*[asyncio.create_task(_fetch_pool(p[0])) for p in pools], return_exceptions=True)
-        trades_by_pool: Dict[str, List[Dict[str, Any]]] = {}
+
+        trades_by_pool: Dict[str, Dict[str, Any]] = {}
         for r in results:
             if isinstance(r, Exception):
                 continue
-            pool_addr, trades = r
+            pool_addr, after_lt, trades = r
             if isinstance(pool_addr, str) and isinstance(trades, list):
-                trades_by_pool[pool_addr] = [t for t in trades if isinstance(t, dict)]
+                trades_by_pool[pool_addr] = {
+                    'after_lt': int(after_lt or 0),
+                    'trades': [t for t in trades if isinstance(t, dict)],
+                }
 
         for pool, rec, sym, token_addr in pools:
-            last_id = str(last_id_map.get(pool, "") or "").strip()
-            trades = trades_by_pool.get(pool) or []
+            pack = trades_by_pool.get(pool)
+            if not pack:
+                continue
+
+            after_lt = int(pack.get('after_lt') or 0)
+            trades: List[Dict[str, Any]] = pack.get('trades') or []
             if not trades:
                 continue
 
-            
-            # Collect trades newer than last_id (walk newest->oldest until we hit last_id)
-            fresh: List[Dict[str, Any]] = []
-            for t in trades:
-                if not isinstance(t, dict):
-                    continue
-                tid = _trade_cursor_id(t)
-                if last_id and tid and tid == last_id:
-                    break
-                fresh.append(t)
+            trades_with_lt = [(_trade_lt_int(t), t) for t in trades]
+            has_lt = any(lt > 0 for lt, _ in trades_with_lt)
 
-            if not fresh:
-                newest_tid = _trade_cursor_id(trades[0]) if isinstance(trades[0], dict) else ""
+            fresh: List[Dict[str, Any]] = []
+
+            if has_lt:
+                # Filter only new trades
+                fresh = [t for (lt, t) in trades_with_lt if lt > after_lt]
+                fresh.sort(key=lambda x: _trade_lt_int(x) or 0)  # oldest -> newest
+
+                # Advance cursor even if we don't post (e.g., sells)
+                max_seen_lt = max((lt for lt, _ in trades_with_lt), default=after_lt)
+                if max_seen_lt > after_lt:
+                    last_lt_map[pool] = max_seen_lt
+
+                # Best-effort last_id
+                newest_trade = max(trades, key=lambda x: _trade_lt_int(x) or 0)
+                newest_tid = _trade_cursor_id(newest_trade)
+                if newest_tid:
+                    last_id_map[pool] = newest_tid
+
+                save_state()
+
+                # Warm start: if we had no cursor yet, don't spam historical trades
+                if after_lt == 0:
+                    continue
+
+            else:
+                # Fallback (no lt field): id/hash cursor
+                last_id = str(last_id_map.get(pool, '') or '').strip()
+
+                # Warm start (no lt): prime cursor and avoid posting backlog
+                if not last_id:
+                    newest_tid = _trade_cursor_id(trades[0]) if isinstance(trades[0], dict) else ''
+                    if newest_tid:
+                        last_id_map[pool] = newest_tid
+                        save_state()
+                    continue
+
+                for t in trades:  # assume newest-first
+                    tid = _trade_cursor_id(t)
+                    if last_id and tid and tid == last_id:
+                        break
+                    fresh.append(t)
+
+                if fresh:
+                    fresh = list(reversed(fresh))  # oldest -> newest
+
+                newest_tid = _trade_cursor_id(trades[0]) if isinstance(trades[0], dict) else ''
                 if newest_tid and newest_tid != last_id:
                     last_id_map[pool] = newest_tid
                     save_state()
-                continue
 
-            # Post in chronological order (oldest -> newest)
-            fresh = list(reversed(fresh))
-
-            newest_tid = _trade_cursor_id(trades[0]) if isinstance(trades[0], dict) else ""
-            if newest_tid:
-                last_id_map[pool] = newest_tid
-                save_state()
-
+            # Process & post buys
             for t in fresh:
-                a_in = t.get("assetIn") or t.get("asset_in") or t.get("inAsset") or t.get("in_asset") or {}
-                a_out = t.get("assetOut") or t.get("asset_out") or t.get("outAsset") or t.get("out_asset") or {}
-                amt_in = t.get("amountIn") or t.get("amount_in") or t.get("inAmount") or t.get("in_amount") or 0
-                amt_out = t.get("amountOut") or t.get("amount_out") or t.get("outAmount") or t.get("out_amount") or 0
+                a_in = t.get('assetIn') or t.get('asset_in') or t.get('inAsset') or t.get('in_asset') or {}
+                a_out = t.get('assetOut') or t.get('asset_out') or t.get('outAsset') or t.get('out_asset') or {}
+                amt_in = t.get('amountIn') or t.get('amount_in') or t.get('inAmount') or t.get('in_amount') or 0
+                amt_out = t.get('amountOut') or t.get('amount_out') or t.get('outAmount') or t.get('out_amount') or 0
 
                 # BUY = TON -> Jetton (our token)
                 if not is_ton_asset(a_in):
@@ -2954,27 +3023,29 @@ async def dedust_tracker_job(context: ContextTypes.DEFAULT_TYPE):
                 if token_amt > 10 ** (dec + 1):
                     token_amt = token_amt / (10 ** dec)
 
-                h = _trade_cursor_id(t)
+                h = _trade_cursor_id(t) or _trade_tx_hash(t)
                 if not h:
-                    ts = t.get("timestamp") or t.get("time") or t.get("createdAt") or t.get("created_at") or ""
-                    h = f"dedust:{pool}:{ts}:{ton_amt}:{token_amt}"
-                txh = _trade_tx_hash(t)
+                    lt = _trade_lt_int(t)
+                    ts = t.get('timestamp') or t.get('time') or t.get('createdAt') or t.get('created_at') or ''
+                    h = f"dedust:{pool}:{lt}:{ts}:{ton_amt}:{token_amt}"
+
                 if h in SEEN_TX_DEDUST:
                     continue
 
-                buyer = (t.get("sender") or t.get("trader") or t.get("buyer") or t.get("from") or "").strip()
+                txh = _trade_tx_hash(t)
+                buyer = (t.get('sender') or t.get('trader') or t.get('buyer') or t.get('from') or '').strip()
 
-                buyers_map = rec.get("buyers")
+                buyers_map = rec.get('buyers')
                 if not isinstance(buyers_map, dict):
                     buyers_map = {}
-                    rec["buyers"] = buyers_map
+                    rec['buyers'] = buyers_map
 
-                pos_txt = "New Holder!" if buyer and buyer not in buyers_map else "Existing Holder"
+                pos_txt = 'New Holder!' if buyer and buyer not in buyers_map else 'Existing Holder'
                 if buyer:
                     buyers_map[buyer] = int(buyers_map.get(buyer, 0)) + 1
                     save_data()
 
-                SEEN_TX_DEDUST[h] = __import__('time').time()
+                SEEN_TX_DEDUST[h] = time.time()
 
                 await post_buy_message(
                     context=context,
@@ -2986,11 +3057,11 @@ async def dedust_tracker_job(context: ContextTypes.DEFAULT_TYPE):
                     ton_amt=ton_amt,
                     token_amt=token_amt,
                     pos_txt=pos_txt,
-                    source_label=(rec.get("dex_label") or "DeDust"),
+                    source_label=(rec.get('dex_label') or 'DeDust'),
                 )
 
     except Exception as e:
-        log.exception("dedust_tracker_job error: %s", e)
+        log.exception('dedust_tracker_job error: %s', e)
 
 
 def main():
