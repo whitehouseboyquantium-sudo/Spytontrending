@@ -1656,10 +1656,8 @@ def build_strength_bar(ton_amt: float) -> str:
             lines.append("".join(chunk))
 
     # Add an extra blank line after the wall so the TON line isn't too close.
-    return "
-".join(lines) + "
-
-"
+    wall = "\n".join(lines)
+    return (wall + "\n\n") if wall else ""
 
 # ===================== MESSAGE SENDER =====================
 async def post_buy_message(
