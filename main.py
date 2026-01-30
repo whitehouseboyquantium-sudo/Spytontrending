@@ -42,7 +42,7 @@ log = logging.getLogger("spyton")
 # -------------------- ENV --------------------
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 # MASTER SpyTON channel (hard-coded)
-MASTER_CHANNEL_ID = int(os.getenv("MASTER_CHANNEL_ID", "-1002379265999"))
+MASTER_CHANNEL_ID = -1002379265999
 # CHANNEL_ID is kept for backward compatibility but master always receives posts.
 CHANNEL_ID = int(os.getenv("CHANNEL_ID", str(MASTER_CHANNEL_ID)))  # -100xxxxxxxxxx
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
@@ -68,7 +68,7 @@ if "spytontrendbot" in _bt_low or "spytontrndbot" in _bt_low:
 else:
     BOOK_TRENDING_URL = _bt
 
-HEADER_IMAGE_PATH = os.getenv("HEADER_IMAGE_PATH", "")  # set env to enable header image
+HEADER_IMAGE_PATH = os.getenv("HEADER_IMAGE_PATH", "header.png")
 
 # -------------------- CUSTOM EMOJI (OPTIONAL) --------------------
 # Put numeric Telegram custom_emoji_id values in Replit Secrets.
@@ -147,13 +147,8 @@ DEX_PAIR_URL = "https://api.dexscreener.com/latest/dex/pairs/ton"
 DEX_TOKEN_URL = "https://api.dexscreener.com/latest/dex/tokens"
 
 # -------------------- FILES --------------------
-DATA_DIR = (os.getenv("DATA_DIR", ".") or ".").strip() or "."
-try:
-    os.makedirs(DATA_DIR, exist_ok=True)
-except Exception:
-    DATA_DIR = "."
-DATA_FILE = os.path.join(DATA_DIR, "data.json")
-STATE_FILE = os.path.join(DATA_DIR, "state.json")
+DATA_FILE = "data.json"
+STATE_FILE = "state.json"
 
 # -------------------- RUNTIME --------------------
 LAST_HTTP_INFO: str = "No requests yet"
@@ -1626,43 +1621,41 @@ def tg_emoji(emoji_id: str, fallback: str) -> str:
     return f"<tg-emoji emoji-id=\"{emoji_id}\">{fallback}</tg-emoji>"
 
 def strength_count_from_ton(ton_amt: float) -> int:
-    """Map TON amount to a premium strength wall size (compact).
+    """Map TON amount to a premium emoji wall size.
 
-    - 12 symbols per line
-    - Usually 1–2 lines, 3 lines only for whales
-    - Hard cap at 36 symbols so alerts don't get too big
+    We render up to 3 lines (12 icons per line => max 36 icons).
+    Ensures at least one full line so the alert always looks premium
+    without making the template too big.
     """
     try:
         t = float(ton_amt or 0.0)
     except Exception:
         t = 0.0
 
-    # Compact tiers (keeps template premium but not massive)
-    if t < 2:
-        return 12          # 1 line
-    if t < 10:
-        return 24          # 2 lines
-    if t < 25:
-        return 30          # 2.5 lines (2 lines + 6)
-    return 36              # 3 lines (cap)
+    # Reduced sizing (template was becoming too big)
+    # Examples:
+    #  - ~10 TON  -> ~18 icons (2 lines)
+    #  - ~20 TON  -> ~30 icons (3 lines)
+    #  -  25+ TON -> capped
+    count = int(t * 1.2) + 6
+    return max(12, min(36, count))
 
 
 def build_strength_bar(ton_amt: float) -> str:
-    """Return a premium strength wall using the ꘜ symbol."""
+    """Return a green-circle emoji wall (up to 3 lines)."""
     filled = strength_count_from_ton(ton_amt)
-    icon = "ꘜ"
+    icon = tg_emoji(SPY_CUSTOM_EMOJI_ID, "🟢")
     icons = [icon] * filled
 
     lines = []
     per_line = 12
     for i in range(0, len(icons), per_line):
-        chunk = icons[i:i + per_line]
+        chunk = icons[i:i+per_line]
         if chunk:
             lines.append("".join(chunk))
 
     # Add an extra blank line after the wall so the TON line isn't too close.
-    wall = "\n".join(lines)
-    return (wall + "\n\n") if wall else ""
+    return "\n".join(lines) + "\n\n"
 
 # ===================== MESSAGE SENDER =====================
 async def post_buy_message(
@@ -1703,12 +1696,10 @@ async def post_buy_message(
         mc_txt = money_fmt(stats.get("marketcap_usd"))
         liq_txt = money_fmt(stats.get("liquidity_usd"))
 
-        holders_val = f"{holders_count:,}" if isinstance(holders_count, int) else "N/A"
-        holders_line = f"👥 Holders: <b>{holders_val}</b>\n"
+        holders_line = f"👥 Holders: <b>{holders_count}</b>\n" if isinstance(holders_count, int) else ""
 
         dex_label = (lbl or source_label or "DEX").strip() or "DEX"
-        token_disp = f"<a href='{tg_url}'>{sym}</a>" if tg_url else sym
-        title = f"<b>{token_disp} Buy! — {dex_label}</b>" if dex_label else f"<b>{token_disp} Buy!</b>"
+        title = f"<b>{sym} Buy! — {dex_label}</b>" if dex_label else f"<b>{sym} Buy!</b>"
 
         # Premium Version 1 layout (used for STON.fi + DeDust)
         ton_line = f"💎 <b>{ton_amt:.2f} TON</b>{usd_part}\n" if ton_amt > 0 else ""
@@ -1842,8 +1833,7 @@ async def post_buy_message(
     for chat_id in targets:
         try:
             await _send_message(chat_id)
-        except Exception as e:
-            log.exception("send buy alert failed chat_id=%s err=%s", chat_id, e)
+        except Exception:
             continue
 
     # Background enrichment: fetch stats/holders and edit messages
@@ -2857,14 +2847,11 @@ async def ston_tracker_job(context: ContextTypes.DEFAULT_TYPE):
             return
 
         last = STATE.get("ston_last_block")
-        warm_start = False
         if not isinstance(last, int) or last <= 0:
-            # First run after deploy/restart:
-            # start close to tip BUT still process a tiny range so the channel doesn't look "dead".
-            last = max(0, int(latest) - 6)
-            STATE["ston_last_block"] = last
-            warm_start = True
+            # First run: start near tip so we don't spam old history
+            STATE["ston_last_block"] = max(0, int(latest) - 2)
             save_state()
+            return
 
         from_block = int(last) + 1
         to_block = int(latest)
@@ -3030,22 +3017,10 @@ async def dedust_tracker_job(context: ContextTypes.DEFAULT_TYPE):
                     last_id_map[pool] = newest_tid
 
                 save_state()
-                # Warm start: if we had no cursor yet, avoid spamming old history.
-                # But DO allow a tiny recent window so the bot looks alive after restarts.
+
+                # Warm start: if we had no cursor yet, don't spam historical trades
                 if after_lt == 0:
-                    # only keep last few trades if they are recent (<=10 min)
-                    try:
-                        now_ts = int(time.time())
-                        def _ts(t):
-                            v = t.get('timestamp') or t.get('time') or t.get('createdAt') or t.get('created_at')
-                            try:
-                                return int(v)
-                            except Exception:
-                                return 0
-                        recent = [t for t in trades if _ts(t) and (now_ts - _ts(t) <= 600)]
-                        trades = (recent[-5:] if recent else trades[-2:])
-                    except Exception:
-                        trades = trades[-2:]
+                    continue
 
             else:
                 # Fallback (no lt field): id/hash cursor

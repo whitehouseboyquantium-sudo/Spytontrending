@@ -18,6 +18,6 @@ POLL_INTERVAL = 8      # seconds
 AD_TEXT = "You can book an ad here"
 TRENDING_URL = "https://t.me/SpyTonTrending"
 
-EMOJI = "ꘜ"
+EMOJI = "🟢"
 USD_PER_EMOJI = 15
 MAX_EMOJI = 60
