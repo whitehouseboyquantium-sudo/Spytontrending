@@ -68,7 +68,7 @@ if "spytontrendbot" in _bt_low or "spytontrndbot" in _bt_low:
 else:
     BOOK_TRENDING_URL = _bt
 
-HEADER_IMAGE_PATH = os.getenv("HEADER_IMAGE_PATH", "header.png")
+HEADER_IMAGE_PATH = os.getenv("HEADER_IMAGE_PATH", "")  # set env to enable header image
 
 # -------------------- CUSTOM EMOJI (OPTIONAL) --------------------
 # Put numeric Telegram custom_emoji_id values in Replit Secrets.
@@ -1698,7 +1698,8 @@ async def post_buy_message(
         mc_txt = money_fmt(stats.get("marketcap_usd"))
         liq_txt = money_fmt(stats.get("liquidity_usd"))
 
-        holders_line = f"👥 Holders: <b>{holders_count}</b>\n" if isinstance(holders_count, int) else ""
+        holders_val = f"{holders_count:,}" if isinstance(holders_count, int) else "N/A"
+        holders_line = f"👥 Holders: <b>{holders_val}</b>\n"
 
         dex_label = (lbl or source_label or "DEX").strip() or "DEX"
         token_disp = f"<a href='{tg_url}'>{sym}</a>" if tg_url else sym
