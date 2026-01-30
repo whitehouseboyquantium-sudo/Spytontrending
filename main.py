@@ -1902,7 +1902,25 @@ async def post_buy_message(
 
 async def update_leaderboard(context: ContextTypes.DEFAULT_TYPE):
     """Auto-updating Top Movers leaderboard (Top 1–10) in Crypton-style format."""
-    lb_id = STATE.get("leaderboard_msg_id")
+    # Always load latest state (survives restarts)
+    load_state()
+
+    # Priority:
+    # 1) saved state.json leaderboard_msg_id
+    # 2) env override LEADERBOARD_MSG_ID (useful if you know the message link id)
+    # 3) pinned message in the channel (self-recover)
+    lb_id = STATE.get("leaderboard_msg_id") or os.getenv("LEADERBOARD_MSG_ID")
+
+    if not lb_id:
+        try:
+            chat = await context.bot.get_chat(CHANNEL_ID)
+            if getattr(chat, "pinned_message", None):
+                lb_id = chat.pinned_message.message_id
+                STATE["leaderboard_msg_id"] = lb_id
+                save_state()
+        except Exception:
+            lb_id = None
+
     if not lb_id:
         return
 
@@ -1999,14 +2017,30 @@ async def update_leaderboard(context: ContextTypes.DEFAULT_TYPE):
     try:
         await context.bot.edit_message_text(
             chat_id=CHANNEL_ID,
-            message_id=lb_id,
+            message_id=int(lb_id),
             text=text,
             parse_mode="HTML",
             disable_web_page_preview=True,
             reply_markup=leaderboard_button(),
         )
     except Exception:
-        pass
+        # If the saved message id is wrong (deleted/new pinned), try to recover from pinned message
+        try:
+            chat = await context.bot.get_chat(CHANNEL_ID)
+            if getattr(chat, "pinned_message", None):
+                new_id = chat.pinned_message.message_id
+                STATE["leaderboard_msg_id"] = new_id
+                save_state()
+                await context.bot.edit_message_text(
+                    chat_id=CHANNEL_ID,
+                    message_id=int(new_id),
+                    text=text,
+                    parse_mode="HTML",
+                    disable_web_page_preview=True,
+                    reply_markup=leaderboard_button(),
+                )
+        except Exception:
+            pass
 
 
 # ===================== JOB: MEMEPAD AUTO-ACTIVATION =====================
