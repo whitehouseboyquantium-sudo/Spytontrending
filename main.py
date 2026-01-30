@@ -42,7 +42,7 @@ log = logging.getLogger("spyton")
 # -------------------- ENV --------------------
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 # MASTER SpyTON channel (hard-coded)
-MASTER_CHANNEL_ID = -1002379265999
+MASTER_CHANNEL_ID = int(os.getenv("MASTER_CHANNEL_ID", "-1002379265999"))
 # CHANNEL_ID is kept for backward compatibility but master always receives posts.
 CHANNEL_ID = int(os.getenv("CHANNEL_ID", str(MASTER_CHANNEL_ID)))  # -100xxxxxxxxxx
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
@@ -147,8 +147,13 @@ DEX_PAIR_URL = "https://api.dexscreener.com/latest/dex/pairs/ton"
 DEX_TOKEN_URL = "https://api.dexscreener.com/latest/dex/tokens"
 
 # -------------------- FILES --------------------
-DATA_FILE = "data.json"
-STATE_FILE = "state.json"
+DATA_DIR = (os.getenv("DATA_DIR", ".") or ".").strip() or "."
+try:
+    os.makedirs(DATA_DIR, exist_ok=True)
+except Exception:
+    DATA_DIR = "."
+DATA_FILE = os.path.join(DATA_DIR, "data.json")
+STATE_FILE = os.path.join(DATA_DIR, "state.json")
 
 # -------------------- RUNTIME --------------------
 LAST_HTTP_INFO: str = "No requests yet"
@@ -1837,7 +1842,8 @@ async def post_buy_message(
     for chat_id in targets:
         try:
             await _send_message(chat_id)
-        except Exception:
+        except Exception as e:
+            log.exception("send buy alert failed chat_id=%s err=%s", chat_id, e)
             continue
 
     # Background enrichment: fetch stats/holders and edit messages
@@ -2851,11 +2857,14 @@ async def ston_tracker_job(context: ContextTypes.DEFAULT_TYPE):
             return
 
         last = STATE.get("ston_last_block")
+        warm_start = False
         if not isinstance(last, int) or last <= 0:
-            # First run: start near tip so we don't spam old history
-            STATE["ston_last_block"] = max(0, int(latest) - 2)
+            # First run after deploy/restart:
+            # start close to tip BUT still process a tiny range so the channel doesn't look "dead".
+            last = max(0, int(latest) - 6)
+            STATE["ston_last_block"] = last
+            warm_start = True
             save_state()
-            return
 
         from_block = int(last) + 1
         to_block = int(latest)
@@ -3021,10 +3030,22 @@ async def dedust_tracker_job(context: ContextTypes.DEFAULT_TYPE):
                     last_id_map[pool] = newest_tid
 
                 save_state()
-
-                # Warm start: if we had no cursor yet, don't spam historical trades
+                # Warm start: if we had no cursor yet, avoid spamming old history.
+                # But DO allow a tiny recent window so the bot looks alive after restarts.
                 if after_lt == 0:
-                    continue
+                    # only keep last few trades if they are recent (<=10 min)
+                    try:
+                        now_ts = int(time.time())
+                        def _ts(t):
+                            v = t.get('timestamp') or t.get('time') or t.get('createdAt') or t.get('created_at')
+                            try:
+                                return int(v)
+                            except Exception:
+                                return 0
+                        recent = [t for t in trades if _ts(t) and (now_ts - _ts(t) <= 600)]
+                        trades = (recent[-5:] if recent else trades[-2:])
+                    except Exception:
+                        trades = trades[-2:]
 
             else:
                 # Fallback (no lt field): id/hash cursor
