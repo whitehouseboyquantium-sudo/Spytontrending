@@ -49,7 +49,8 @@ def build_buy_message(
     pair_url: str,
     # Optional data (if you have real swap parsing later)
     amount_ton: float | None = None,
-    buyer: str = "",
+ c 
+    buyer: str = "",b
     tx_url:  str = "",
     position: str = "",
     # Button URLs
