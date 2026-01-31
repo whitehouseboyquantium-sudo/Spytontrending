@@ -159,6 +159,11 @@ SEEN_TX_DEDUST: Dict[str, float] = {}
 SEEN_TX_BLUM: Dict[str, float] = {}
 SEEN_TTL_SECONDS = 3600
 
+
+# Prevent overlapping polls (can cause duplicates/spam)
+DEDUST_POLL_LOCK = asyncio.Lock()
+STON_POLL_LOCK = asyncio.Lock()
+BLUM_POLL_LOCK = asyncio.Lock()
 PAIR_CACHE: Dict[str, Dict[str, Any]] = {}
 PAIR_CACHE_TTL = 30
 
@@ -334,7 +339,7 @@ def _to_hex_tx_hash(h: Any) -> str:
 
     return ""
 
-def make_tx_url(tx_hash: str, fallback_url: str = "") -> str:
+def make_tx_url(tx_hash: Any, fallback_url: str = "") -> str:
     """Return a working explorer link for the given tx hash.
 
     Prefer Tonviewer (works with tx hash only). If hash cannot be normalized,
@@ -400,6 +405,39 @@ def _trade_lt_int(t: Dict[str, Any]) -> int:
 
     return 0
 
+
+def _trade_ts_int(t: Dict[str, Any]) -> int:
+    """Best-effort unix timestamp for DeDust trades (seconds)."""
+    if not isinstance(t, dict):
+        return 0
+
+    def _as_int(x: Any) -> int:
+        if isinstance(x, int):
+            return x
+        if isinstance(x, float):
+            return int(x)
+        if isinstance(x, str):
+            x = x.strip()
+            if x.isdigit():
+                return int(x)
+            # ISO strings not handled
+        return 0
+
+    for k in ("timestamp", "time", "created_at", "createdAt", "ts", "utime"):
+        v = _as_int(t.get(k))
+        if v:
+            # if milliseconds, convert
+            return v // 1000 if v > 10_000_000_000 else v
+
+    tx = t.get("transaction")
+    if isinstance(tx, dict):
+        for k in ("utime", "timestamp", "time"):
+            v = _as_int(tx.get(k))
+            if v:
+                return v // 1000 if v > 10_000_000_000 else v
+
+    return 0
+
 def file_exists(path: str) -> bool:
     try:
         return os.path.isfile(path)
@@ -460,11 +498,17 @@ def load_state():
             STATE.update(s)
         STATE.setdefault("dedust_last_id", {})
         STATE.setdefault("dedust_last_lt", {})
+        STATE.setdefault("dedust_last_ts", {})
+        STATE.setdefault("dedust_seen", {})
         STATE.setdefault("blum_last_lt", {})
         if not isinstance(STATE["dedust_last_id"], dict):
             STATE["dedust_last_id"] = {}
         if not isinstance(STATE["dedust_last_lt"], dict):
             STATE["dedust_last_lt"] = {}
+        if not isinstance(STATE.get("dedust_last_ts"), dict):
+            STATE["dedust_last_ts"] = {}
+        if not isinstance(STATE.get("dedust_seen"), dict):
+            STATE["dedust_seen"] = {}
         if not isinstance(STATE["blum_last_lt"], dict):
             STATE["blum_last_lt"] = {}
     except:
@@ -1666,7 +1710,7 @@ async def post_buy_message(
     token_addr: str,
     pair_id: str,
     buyer: str,
-    tx_hash: str,
+    tx_hash: Any,
     ton_amt: float,
     token_amt: float,
     pos_txt: str,
@@ -1709,13 +1753,10 @@ async def post_buy_message(
         ton_line = f"💎 <b>{ton_amt:.2f} TON</b>{usd_part}\n" if ton_amt > 0 else ""
         token_line = f"🪙 <b>{token_amt:,.2f} {sym}</b>\n" if token_amt > 0 else ""
 
-        if tx_url:
-            if buyer_url:
-                wallet_line = f"👤 <a href='{buyer_url}'>{short(buyer)}</a> | <a href='{tx_url}'>Txn</a>\n"
-            else:
-                wallet_line = f"👤 {short(buyer)} | <a href='{tx_url}'>Txn</a>\n"
-        else:
-            wallet_line = f"👤 {short(buyer)} | Txn\n"
+        buyer_part = f"<a href='{buyer_url}'>{short(buyer)}</a>" if buyer_url else short(buyer)
+        txn_part = f"<a href='{tx_url}'>Txn</a>" if tx_url else "Txn"
+        wallet_line = f"👤 {buyer_part} | {txn_part}\n"
+
 
         text = (
             f"{title}\n\n"
@@ -2923,199 +2964,182 @@ async def ston_tracker_job(context: ContextTypes.DEFAULT_TYPE):
 
 
 
+
+
 async def dedust_tracker_job(context: ContextTypes.DEFAULT_TYPE):
     """Poll DeDust trades via the public DeDust API and post BUY-ONLY swaps.
 
     Fixes:
-    - Stops reposting old trades by using a per-pool cursor (after_lt) persisted in state.json
-    - Still de-dups in-memory by trade cursor/hash to protect against endpoint quirks
-    - Keeps network I/O off the asyncio loop (requests runs in a thread)
+    - Prevents spam (lock + robust cursor + persistent de-dupe cache)
+    - Cursor uses LT when available, otherwise timestamp, otherwise stable id/hash
+    - Wallet link stays clickable even if tx hash is missing (handled in post_buy_message)
     """
+    global LAST_HTTP_INFO, LAST_EVENTS_COUNT
+
     if not DEDUST_ENABLED:
         return
-    try:
-        cleanup_seen()
-        load_data()
-        load_state()
+    if DEDUST_POLL_LOCK.locked():
+        return
 
-        # Persistent cursors (survive Railway restarts)
-        last_id_map = STATE.setdefault('dedust_last_id', {})
-        if not isinstance(last_id_map, dict):
-            last_id_map = {}
-            STATE['dedust_last_id'] = last_id_map
+    async with DEDUST_POLL_LOCK:
+        try:
+            pools = DATA.get("dedust_pools") or {}
+            if not isinstance(pools, dict) or not pools:
+                return
 
-        last_lt_map = STATE.setdefault('dedust_last_lt', {})
-        if not isinstance(last_lt_map, dict):
-            last_lt_map = {}
-            STATE['dedust_last_lt'] = last_lt_map
+            last_id_map: Dict[str, str] = STATE.get("dedust_last_id", {}) if isinstance(STATE.get("dedust_last_id"), dict) else {}
+            last_lt_map: Dict[str, int] = STATE.get("dedust_last_lt", {}) if isinstance(STATE.get("dedust_last_lt"), dict) else {}
+            last_ts_map: Dict[str, int] = STATE.get("dedust_last_ts", {}) if isinstance(STATE.get("dedust_last_ts"), dict) else {}
 
-        # Collect pools first so we can fetch in parallel
-        pools: List[Tuple[str, Dict[str, Any], str, str]] = []  # (pool, rec, sym, token_addr)
-        for pool, rec in DATA.get('pairs', {}).items():
-            if not isinstance(rec, dict):
-                continue
-            if str(rec.get('dex', '')).lower() != 'dedust':
-                continue
-            sym = (rec.get('symbol') or '?').strip().upper()
-            token_addr = (rec.get('token_address') or '').strip()
-            if not token_addr:
-                continue
-            pools.append((pool, rec, sym, token_addr))
+            # Persistent seen cache (prevents reposts after restarts)
+            seen_persist: Dict[str, float] = STATE.get("dedust_seen", {}) if isinstance(STATE.get("dedust_seen"), dict) else {}
+            now = time.time()
 
-        if not pools:
-            return
-
-        sem = asyncio.Semaphore(int(os.getenv('DEDUST_CONCURRENCY', '16')))
-
-        async def _fetch_pool(pool_addr: str):
-            async with sem:
+            # prune old
+            for k in list(seen_persist.keys()):
                 try:
-                    after_lt = int(last_lt_map.get(pool_addr, 0) or 0)
+                    if now - float(seen_persist.get(k, 0.0)) > SEEN_TTL_SECONDS:
+                        seen_persist.pop(k, None)
                 except Exception:
-                    after_lt = 0
-                trades = await _to_thread(dedust_fetch_trades, pool_addr, DEDUST_POLL_LIMIT, after_lt)
-                return pool_addr, after_lt, trades
+                    seen_persist.pop(k, None)
 
-        results = await asyncio.gather(*[asyncio.create_task(_fetch_pool(p[0])) for p in pools], return_exceptions=True)
+            total_new = 0
 
-        trades_by_pool: Dict[str, Dict[str, Any]] = {}
-        for r in results:
-            if isinstance(r, Exception):
-                continue
-            pool_addr, after_lt, trades = r
-            if isinstance(pool_addr, str) and isinstance(trades, list):
-                trades_by_pool[pool_addr] = {
-                    'after_lt': int(after_lt or 0),
-                    'trades': [t for t in trades if isinstance(t, dict)],
-                }
+            for pool, rec in pools.items():
+                if not pool:
+                    continue
 
-        for pool, rec, sym, token_addr in pools:
-            pack = trades_by_pool.get(pool)
-            if not pack:
-                continue
+                trades = dedust_fetch_trades(pool, limit=25)
+                if not trades:
+                    continue
 
-            after_lt = int(pack.get('after_lt') or 0)
-            trades: List[Dict[str, Any]] = pack.get('trades') or []
-            if not trades:
-                continue
+                last_lt = int(last_lt_map.get(pool, 0) or 0)
+                last_ts = int(last_ts_map.get(pool, 0) or 0)
+                last_id = str(last_id_map.get(pool, "") or "")
 
-            trades_with_lt = [(_trade_lt_int(t), t) for t in trades]
-            has_lt = any(lt > 0 for lt, _ in trades_with_lt)
+                max_lt = 0
+                max_ts = 0
+                for t in trades:
+                    lt = _trade_lt_int(t)
+                    if lt > max_lt:
+                        max_lt = lt
+                    ts = _trade_ts_int(t)
+                    if ts > max_ts:
+                        max_ts = ts
 
-            fresh: List[Dict[str, Any]] = []
+                # Warm start (avoid dumping history)
+                if last_lt == 0 and last_ts == 0 and not last_id:
+                    if max_lt:
+                        last_lt_map[pool] = max_lt
+                    if max_ts:
+                        last_ts_map[pool] = max_ts
+                    newest_id = _trade_tx_hash(trades[0]) or _trade_cursor_id(trades[0]) or ""
+                    if newest_id:
+                        last_id_map[pool] = str(newest_id)
+                    continue
 
-            if has_lt:
-                # Filter only new trades
-                fresh = [t for (lt, t) in trades_with_lt if lt > after_lt]
-                fresh.sort(key=lambda x: _trade_lt_int(x) or 0)  # oldest -> newest
+                fresh: List[Dict[str, Any]] = []
 
-                # Advance cursor even if we don't post (e.g., sells)
-                max_seen_lt = max((lt for lt, _ in trades_with_lt), default=after_lt)
-                if max_seen_lt > after_lt:
-                    last_lt_map[pool] = max_seen_lt
+                if max_lt:
+                    for t in trades:
+                        lt = _trade_lt_int(t)
+                        if lt and lt > last_lt:
+                            fresh.append(t)
+                    last_lt_map[pool] = max(last_lt, max_lt)
+                elif max_ts:
+                    for t in trades:
+                        ts = _trade_ts_int(t)
+                        if ts and ts > last_ts:
+                            fresh.append(t)
+                    last_ts_map[pool] = max(last_ts, max_ts)
+                else:
+                    newest_id = _trade_tx_hash(trades[0]) or _trade_cursor_id(trades[0]) or ""
+                    if newest_id:
+                        last_id_map[pool] = str(newest_id)
+                    if not last_id:
+                        continue
+                    for t in trades:
+                        tid = _trade_tx_hash(t) or _trade_cursor_id(t) or ""
+                        if tid and tid == last_id:
+                            break
+                        fresh.append(t)
+                    fresh = list(reversed(fresh))
 
-                # Best-effort last_id
-                newest_trade = max(trades, key=lambda x: _trade_lt_int(x) or 0)
-                newest_tid = _trade_cursor_id(newest_trade)
-                if newest_tid:
-                    last_id_map[pool] = newest_tid
+                if not fresh:
+                    continue
 
+                # Save cursors early
+                STATE["dedust_last_id"] = last_id_map
+                STATE["dedust_last_lt"] = last_lt_map
+                STATE["dedust_last_ts"] = last_ts_map
+                STATE["dedust_seen"] = seen_persist
                 save_state()
 
-                # Warm start: if we had no cursor yet, don't spam historical trades
-                if after_lt == 0:
-                    continue
+                for t in fresh:
+                    key_any = _trade_tx_hash(t) or _trade_cursor_id(t) or f"{_trade_ts_int(t)}:{t.get('inAmount')}:{t.get('outAmount')}"
+                    key = str(key_any)
+                    if key in SEEN_TX_DEDUST or key in seen_persist:
+                        continue
 
-            else:
-                # Fallback (no lt field): id/hash cursor
-                last_id = str(last_id_map.get(pool, '') or '').strip()
+                    SEEN_TX_DEDUST[key] = now
+                    seen_persist[key] = now
 
-                # Warm start (no lt): prime cursor and avoid posting backlog
-                if not last_id:
-                    newest_tid = _trade_cursor_id(trades[0]) if isinstance(trades[0], dict) else ''
-                    if newest_tid:
-                        last_id_map[pool] = newest_tid
-                        save_state()
-                    continue
+                    # Buy detection: TON -> token
+                    in_amt = _parse_float(t.get("inAmount") or t.get("in_amount") or t.get("amountIn"))
+                    out_amt = _parse_float(t.get("outAmount") or t.get("out_amount") or t.get("amountOut"))
+                    if not in_amt or not out_amt:
+                        continue
 
-                for t in trades:  # assume newest-first
-                    tid = _trade_cursor_id(t)
-                    if last_id and tid and tid == last_id:
-                        break
-                    fresh.append(t)
+                    if _is_ton_asset(t.get("inAsset") or t.get("in_asset")):
+                        ton_amt = in_amt
+                        token_amt = out_amt
+                    else:
+                        # token->TON (sell) or non-TON swap
+                        continue
 
-                if fresh:
-                    fresh = list(reversed(fresh))  # oldest -> newest
+                    sym = rec.get("symbol") or rec.get("ticker") or rec.get("name") or "TOKEN"
+                    token_addr = rec.get("token") or rec.get("token_addr") or rec.get("jetton") or ""
+                    buyer = (t.get("sender") or t.get("trader") or t.get("from") or t.get("buyer") or t.get("account") or "")
+                    buyer = str(buyer) if buyer else ""
 
-                newest_tid = _trade_cursor_id(trades[0]) if isinstance(trades[0], dict) else ''
-                if newest_tid and newest_tid != last_id:
-                    last_id_map[pool] = newest_tid
-                    save_state()
+                    txh = _trade_tx_hash(t) or t.get("txHash") or t.get("transactionHash") or t.get("hash")
 
-            # Process & post buys
-            for t in fresh:
-                a_in = t.get('assetIn') or t.get('asset_in') or t.get('inAsset') or t.get('in_asset') or {}
-                a_out = t.get('assetOut') or t.get('asset_out') or t.get('outAsset') or t.get('out_asset') or {}
-                amt_in = t.get('amountIn') or t.get('amount_in') or t.get('inAmount') or t.get('in_amount') or 0
-                amt_out = t.get('amountOut') or t.get('amount_out') or t.get('outAmount') or t.get('out_amount') or 0
+                    pos_txt = ""
+                    try:
+                        if isinstance(t.get("priceImpact"), (int, float)):
+                            pos_txt = f"+{float(t.get('priceImpact')):.1f}%"
+                    except Exception:
+                        pos_txt = ""
 
-                # BUY = TON -> Jetton (our token)
-                if not is_ton_asset(a_in):
-                    continue
+                    total_new += 1
+                    await post_buy_message(
+                        context=context,
+                        sym=sym,
+                        token_addr=token_addr,
+                        pair_id=pool,
+                        buyer=buyer,
+                        tx_hash=txh,
+                        ton_amt=ton_amt,
+                        token_amt=token_amt,
+                        pos_txt=pos_txt,
+                        source_label=(rec.get("dex_label") or "DeDust"),
+                    )
 
-                out_addr = extract_jetton_master(a_out)
-                if out_addr and out_addr != token_addr:
-                    continue
+            if len(seen_persist) > 800:
+                items = sorted(seen_persist.items(), key=lambda kv: kv[1], reverse=True)[:600]
+                seen_persist = dict(items)
 
-                ton_amt = safe_float(amt_in)
-                if ton_amt > 1e6:
-                    ton_amt = ton_amt / 1e9
+            STATE["dedust_last_id"] = last_id_map
+            STATE["dedust_last_lt"] = last_lt_map
+            STATE["dedust_last_ts"] = last_ts_map
+            STATE["dedust_seen"] = seen_persist
+            save_state()
 
-                dec = get_jetton_decimals(token_addr)
-                token_amt = safe_float(amt_out)
-                if token_amt > 10 ** (dec + 1):
-                    token_amt = token_amt / (10 ** dec)
+            if total_new:
+                LAST_EVENTS_COUNT = total_new
 
-                h = _trade_cursor_id(t) or _trade_tx_hash(t)
-                if not h:
-                    lt = _trade_lt_int(t)
-                    ts = t.get('timestamp') or t.get('time') or t.get('createdAt') or t.get('created_at') or ''
-                    h = f"dedust:{pool}:{lt}:{ts}:{ton_amt}:{token_amt}"
-
-                if h in SEEN_TX_DEDUST:
-                    continue
-
-                txh = _trade_tx_hash(t)
-                buyer = (t.get('sender') or t.get('trader') or t.get('buyer') or t.get('from') or '').strip()
-
-                buyers_map = rec.get('buyers')
-                if not isinstance(buyers_map, dict):
-                    buyers_map = {}
-                    rec['buyers'] = buyers_map
-
-                pos_txt = 'New Holder!' if buyer and buyer not in buyers_map else 'Existing Holder'
-                if buyer:
-                    buyers_map[buyer] = int(buyers_map.get(buyer, 0)) + 1
-                    save_data()
-
-                SEEN_TX_DEDUST[h] = time.time()
-
-                await post_buy_message(
-                    context=context,
-                    sym=sym,
-                    token_addr=token_addr,
-                    pair_id=pool,
-                    buyer=buyer,
-                    tx_hash=txh,
-                    ton_amt=ton_amt,
-                    token_amt=token_amt,
-                    pos_txt=pos_txt,
-                    source_label=(rec.get('dex_label') or 'DeDust'),
-                )
-
-    except Exception as e:
-        log.exception('dedust_tracker_job error: %s', e)
-
+        except Exception as e:
+            log.exception("dedust_tracker_job error: %s", e)
 
 def main():
     if not BOT_TOKEN:
