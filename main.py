@@ -1,5 +1,6 @@
 
 import os
+import html
 import json
 import time
 import asyncio
@@ -8,7 +9,7 @@ import re
 import threading
 import logging
 import requests
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import urlparse, parse_qs, quote
 from typing import Any, Dict, Optional, List, Tuple
 
 from flask import Flask
@@ -89,6 +90,8 @@ ICON_POOLS_ID   = os.getenv("ICON_POOLS_ID", "").strip()
 
 
 TONAPI_KEY = os.getenv("TONAPI_KEY", "")
+DTRADE_START_PREFIX = os.getenv("DTRADE_START_PREFIX", "11TYq7LInG_")
+
 TONAPI_BASE = os.getenv("TONAPI_BASE", "https://tonapi.io")
 
 DEDUST_ENABLED = os.getenv("DEDUST_ENABLED", "1") == "1"
@@ -1754,24 +1757,22 @@ def strength_count_from_ton(ton_amt: float) -> int:
     return 60              # 3 lines (cap)
 
 
-def build_strength_bar(ton_amt: float) -> str:
-    """Return a premium strength wall using the ꘜ symbol."""
-    filled = strength_count_from_ton(ton_amt)
-    icon = "ꘜ"
-    icons = [icon] * filled
-
+def build_strength_bar(ton_amount: float) -> str:
+    """Wide strength wall using green circles (Maxiton-style)."""
+    # 0.5 TON per dot, clamp 1..60
+    dots = int(max(1, min(60, round(ton_amount / 0.5))))
+    per_line = 15
+    icon = "🟢"
     lines = []
-    per_line = 20
-    for i in range(0, len(icons), per_line):
-        chunk = icons[i:i + per_line]
-        if chunk:
-            lines.append("".join(chunk))
+    for i in range(0, dots, per_line):
+        lines.append(icon * min(per_line, dots - i))
+    return "\n".join(lines[:4])
 
-    # Add an extra blank line after the wall so the TON line isn't too close.
-    wall = "\n".join(lines)
-    return (wall + "\n\n") if wall else ""
+def build_dtrade_link(token_addr: str) -> str:
+    # Telegram deep-link: start=<ref_prefix><token_addr>
+    start = f"{DTRADE_START_PREFIX}{token_addr}"
+    return f"https://t.me/dtrade?start={quote(start)}"
 
-# ===================== MESSAGE SENDER =====================
 async def post_buy_message(
     context: ContextTypes.DEFAULT_TYPE,
     sym: str,
@@ -1803,63 +1804,48 @@ async def post_buy_message(
                 break
 
     # Compose function so we can send fast then edit later
-    def _compose(ton_usd_val: float, stats: Dict[str, Any], holders_count: Optional[int]) -> Tuple[str, str]:
-        usd_val = ton_amt * ton_usd_val if ton_usd_val > 0 and ton_amt > 0 else 0.0
-        usd_part = f" (${usd_val:,.2f})" if usd_val else ""
+    def _compose(ton_usd_val, stats: dict, holders_count=None):
+        # --- Maxiton-inspired SpyTON Premium template ---
+        name_safe = html.escape(str(token_name))
+        sym_safe = html.escape(str(sym))
+        dex_safe = html.escape(str(source_label))
 
-        mc_txt = money_fmt(stats.get("marketcap_usd"))
-        liq_txt = money_fmt(stats.get("liquidity_usd"))
+        if tg_url:
+            name_line = f"🟩 | <a href='{tg_url}'>{name_safe}</a>"
+            sym_line = f"<a href='{tg_url}'><b>{sym_safe}</b></a> Buy! — {dex_safe}"
+        else:
+            name_line = f"🟩 | {name_safe}"
+            sym_line = f"<b>{sym_safe}</b> Buy! — {dex_safe}"
 
-        holders_val = f"{holders_count:,}" if isinstance(holders_count, int) else "N/A"
-        holders_line = f"👥 Holders: <b>{holders_val}</b>\n"
+        strength_wall = build_strength_bar(ton_amt)
 
-        dex_label = (lbl or source_label or "DEX").strip() or "DEX"
-        token_disp = f"<a href='{tg_url}'>{sym}</a>" if tg_url else sym
-        title = f"<b>{token_disp} Buy! — {dex_label}</b>" if dex_label else f"<b>{token_disp} Buy!</b>"
+        holders_txt = f"{int(holders_count):,}" if holders_count else "N/A"
 
-        # Premium Version 1 layout (used for STON.fi + DeDust)
-        ton_line = f"💎 <b>{ton_amt:.2f} TON</b>{usd_part}\n" if ton_amt > 0 else ""
-        token_line = f"🪙 <b>{token_amt:,.2f} {sym}</b>\n" if token_amt > 0 else ""
+        chart_part = f"<a href='{chart_url}'>📈 Chart</a>" if chart_url else "📈 Chart"
+        trending_part = f"<a href='{TRENDING_URL}'>🔥 Trending</a>" if TRENDING_URL else "🔥 Trending"
+        dtrade_url = build_dtrade_link(token_addr)
+        dtrade_part = f"<a href='{dtrade_url}'>🛒 DTrade</a>"
 
-        buyer_part = f"<a href='{buyer_url}'>{short(buyer)}</a>" if buyer_url else short(buyer)
-        txn_part = f"<a href='{tx_url}'>Txn</a>" if tx_url else "Txn"
-        wallet_line = f"👤 {buyer_part} | {txn_part}\n"
+        footer = f"{chart_part} | {trending_part} | {dtrade_part}"
 
+        buyer_part = f"<a href='{buyer_url}'>{wallet_short}</a>" if buyer_url else wallet_short
+        tx_part = f"<a href='{tx_url}'>Txn</a>" if tx_url else "Txn"
 
         text = (
-            f"{title}\n\n"
-            f"{build_strength_bar(ton_amt)}"
-            f"{ton_line}"
-            f"{token_line}\n"
-            f"{wallet_line}\n"
-            f"{holders_line}"
-            f"💧 Liquidity: <b>{liq_txt}</b>\n"
-            f"📊 MCap: <b>{mc_txt}</b>\n\n"
-            f"📈 <a href='{chart_url}'>Chart</a> | "
-            f"🔥 <a href='{TRENDING_URL}'>Trending</a> | "
-            f"🆕 <a href='{pools_url}'>Pools</a>"
+            f"{name_line}\n\n"
+            f"{sym_line}\n"
+            f"{strength_wall}\n\n"
+            f"💎 {ton_amt:,.2f} TON ({money_fmt(ton_usd_val)})\n"
+            f"🪙 {token_amt:,.2f} {sym_safe}\n"
+            f"👤 {buyer_part} | {tx_part}\n"
+            f"👥 Holders: {holders_txt}\n"
+            f"💧 Liquidity: {money_fmt(stats.get('liq'))}\n"
+            f"📊 MCap: {money_fmt(stats.get('mcap'))}\n\n"
+            f"{footer}"
         )
 
-# GROUP STYLE (exact template user wants)
-        dex_lbl_plain = (lbl or source_label or "DEX").strip() or "DEX"
-        grp_pos = "New!" if "new" in (pos_txt or "").lower() else "Old!"
-        price_val = stats.get("price_usd")
-        price_txt = f"{price_val:.6f}".rstrip("0").rstrip(".") if isinstance(price_val, (int, float)) and price_val > 0 else "—"
-        mc_val_raw = stats.get("marketcap_usd")
-        mc_group = f"{mc_val_raw:,.0f}" if isinstance(mc_val_raw, (int, float)) and mc_val_raw > 0 else "—"
-        usd_group = f"{usd_val:,.2f}" if usd_val else ""
-        buyer_group = short(buyer)
-        group_text = (
-            f"🚀 {sym} TOKEN Buy! — {dex_lbl_plain}\n"
-            f"✅ LISTED!\n\n"
-            f"{'💡'*10}\n\n"
-            f"💰 {ton_amt:.2f} TON ({'$' + usd_group if usd_group else '$0'})\n"
-            f"📦 {token_amt:,.2f} {sym}\n"
-            f"👤 {buyer_group} | {grp_pos}\n"
-            f"💵 Price: ${price_txt}\n"
-            f"🏦 MarketCap: ${mc_group}\n\n"
-            f"❤️ <a href='{LISTING_URL}'>TonListing</a> | 📊 <a href='{chart_url}'>Chart</a>"
-        )
+        # Group text (if you ever post in token groups) - keep simple but consistent
+        group_text = text
         return text, group_text
 
     # FAST: send immediately with placeholders, then edit with enriched stats
