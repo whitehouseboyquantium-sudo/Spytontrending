@@ -2879,7 +2879,8 @@ async def ston_tracker_job(context: ContextTypes.DEFAULT_TYPE):
     if TONAPI_KEY:
         try:
             await ston_tracker_job_fast(context)
-            return
+            # continue to export-feed poll as fallback (seen.json dedupes)
+
         except Exception as e:
             log.exception("ston_tracker_job_fast failed, falling back: %s", e)
     try:
