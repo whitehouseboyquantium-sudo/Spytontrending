@@ -1034,22 +1034,49 @@ def tonapi_headers() -> Dict[str, str]:
         return {"Accept": "application/json"}
     return {"Authorization": f"Bearer {TONAPI_KEY}", "Accept": "application/json"}
 
-def tonapi_get(url: str, params: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
+def tonapi_get_raw(url: str, params: Optional[Dict[str, Any]] = None) -> Optional[Any]:
+    """Low-level TonAPI GET that can return dict or list.
+
+    Tries Bearer auth, then X-API-Key, then no-auth fallback.
+    This helps when users accidentally set a TonCenter key in TONAPI_KEY.
+    """
     try:
+        # 1) Bearer (preferred)
         res = requests.get(url, headers=tonapi_headers(), params=params, timeout=20)
-        if res.status_code == 401 and TONAPI_KEY:
-            res = requests.get(url, headers={"X-API-Key": TONAPI_KEY, "Accept": "application/json"}, params=params, timeout=20)
+
+        # 2) Some deployments use X-API-Key
+        if res.status_code in (401, 403) and TONAPI_KEY:
+            res = requests.get(
+                url,
+                headers={"X-API-Key": TONAPI_KEY, "Accept": "application/json"},
+                params=params,
+                timeout=20,
+            )
+
+        # 3) If key is wrong, TonAPI may still work without auth (rate-limited)
+        if res.status_code in (401, 403) and TONAPI_KEY:
+            res = requests.get(url, headers={"Accept": "application/json"}, params=params, timeout=20)
+
+        # 4) Tiny retry on rate limit
+        if res.status_code == 429:
+            try:
+                time.sleep(0.8)
+            except:
+                pass
+            res = requests.get(url, headers={"Accept": "application/json"}, params=params, timeout=20)
+
         if res.status_code != 200:
             return None
-        js = res.json()
-        return js if isinstance(js, dict) else None
+
+        return res.json()
     except:
         return None
 
 
-# ===================== Jetton meta cache (decimals) =====================
-JETTON_DECIMALS_CACHE: Dict[str, int] = {}
-
+def tonapi_get(url: str, params: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
+    """TonAPI GET returning a dict (or None)."""
+    js = tonapi_get_raw(url, params=params)
+    return js if isinstance(js, dict) else None
 def get_jetton_decimals(jetton_master: str) -> int:
     """Best-effort decimals lookup via TonAPI. Defaults to 9."""
     if not jetton_master:
@@ -1160,7 +1187,7 @@ def extract_jetton_master(asset_obj: Any) -> str:
     return ""
 
 def fetch_holders_count_tonapi(jetton_address: str) -> Optional[int]:
-    if not TONAPI_KEY or not jetton_address:
+    if not jetton_address:
         return None
 
     # Cache (avoid rate limits / keep first message non-N/A after we've seen the token once)
@@ -1179,7 +1206,7 @@ def fetch_holders_count_tonapi(jetton_address: str) -> Optional[int]:
             return hv
 
     # 1) Primary: jetton details endpoint
-    js = tonapi_get(f"{TONAPI_BASE.rstrip('/')}/v2/jettons/{jetton_address}")
+    js = tonapi_get_raw(f"{TONAPI_BASE.rstrip('/')}/v2/jettons/{jetton_address}")
     if isinstance(js, dict):
         for k in ("holders_count", "holdersCount", "holders", "holdersCountTotal"):
             v = js.get(k)
@@ -1204,7 +1231,7 @@ def fetch_holders_count_tonapi(jetton_address: str) -> Optional[int]:
                     return hv
 
     # 2) Fallback: holders list endpoint usually returns a total
-    js2 = tonapi_get(
+    js2 = tonapi_get_raw(
         f"{TONAPI_BASE.rstrip('/')}/v2/jettons/{jetton_address}/holders",
         params={"limit": 1, "offset": 0},
     )
