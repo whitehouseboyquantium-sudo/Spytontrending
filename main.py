@@ -8,8 +8,8 @@ import re
 import threading
 import logging
 import requests
+import html
 from urllib.parse import urlparse, parse_qs
-from html import escape as html_escape
 from typing import Any, Dict, Optional, List, Tuple
 
 from flask import Flask
@@ -50,8 +50,6 @@ ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 
 TON_PRICE_API = os.getenv("TON_PRICE_API", "")  # optional (coingecko-style)
 TRENDING_URL = os.getenv("TRENDING_URL", "https://t.me/SpyTonTrending")
-DTRADE_START_PREFIX = os.getenv('DTRADE_START_PREFIX', '11TYq7LInG_')
-DTRADE_BOT_USERNAME = os.getenv('DTRADE_BOT_USERNAME', 'dtrade')
 LISTING_URL = os.getenv("LISTING_URL", "https://t.me/TonProjectListing")
 # Book Trending link (button)
 # Accept either BOOK_TRENDING_URL or BOOK_TRENDING_LINK from Secrets.
@@ -70,6 +68,10 @@ if "spytontrendbot" in _bt_low or "spytontrndbot" in _bt_low:
     BOOK_TRENDING_URL = "https://t.me/SpyTONTrndBot"
 else:
     BOOK_TRENDING_URL = _bt
+
+# DTrade deep-link (referral)
+DTRADE_BOT_USERNAME = (os.getenv("DTRADE_BOT_USERNAME", "dtrade") or "dtrade").strip().lstrip("@")
+DTRADE_START_PREFIX = (os.getenv("DTRADE_START_PREFIX", "11TYq7LInG_") or "11TYq7LInG_").strip()
 
 HEADER_IMAGE_PATH = os.getenv("HEADER_IMAGE_PATH", "")  # set env to enable header image
 
@@ -741,7 +743,7 @@ def fetch_pair_stats(pair_id: str) -> Dict[str, Any]:
     if cached and (now - cached.get("_ts", 0) < PAIR_CACHE_TTL):
         return cached
 
-    out = {"liquidity_usd": None, "marketcap_usd": None, "volume_h6_usd": None, "token_name": None, "token_symbol": None, "_ts": now}
+    out = {"liquidity_usd": None, "marketcap_usd": None, "volume_h6_usd": None, "_ts": now}
     url = f"{DEX_PAIR_URL}/{pair_id}"
     try:
         res = requests.get(url, timeout=15)
@@ -756,14 +758,6 @@ def fetch_pair_stats(pair_id: str) -> Dict[str, Any]:
             return out
 
         p0 = pairs[0]
-        try:
-            bt = p0.get('baseToken') or {}
-            if isinstance(bt, dict):
-                out['token_name'] = bt.get('name') or out.get('token_name')
-                out['token_symbol'] = bt.get('symbol') or out.get('token_symbol')
-        except:
-            pass
-
         liq = p0.get("liquidity", {})
         if isinstance(liq, dict):
             v = safe_float(liq.get("usd"))
@@ -802,7 +796,7 @@ def fetch_token_stats(token_addr: str) -> Dict[str, Any]:
     if cached and (now - cached.get("_ts", 0) < PAIR_CACHE_TTL):
         return cached
 
-    out = {"liquidity_usd": None, "marketcap_usd": None, "price_usd": None, "token_name": None, "token_symbol": None, "_ts": now}
+    out = {"liquidity_usd": None, "marketcap_usd": None, "price_usd": None, "_ts": now}
     try:
         url = f"{DEX_TOKEN_URL}/{token_addr}"
         res = requests.get(url, timeout=15)
@@ -829,13 +823,6 @@ def fetch_token_stats(token_addr: str) -> Dict[str, Any]:
                 best = p
 
         if best:
-            try:
-                bt = best.get('baseToken') or {}
-                if isinstance(bt, dict):
-                    out['token_name'] = bt.get('name') or out.get('token_name')
-                    out['token_symbol'] = bt.get('symbol') or out.get('token_symbol')
-            except:
-                pass
             out["liquidity_usd"] = best_liq if best_liq > 0 else None
             mc_val = safe_float(best.get("marketCap"))
             fdv_val = safe_float(best.get("fdv"))
@@ -858,7 +845,7 @@ def fetch_pair_meta(pair_id: str) -> Dict[str, Any]:
     cached = PAIR_META_CACHE.get(pair_id)
     if cached and (now - cached.get("_ts", 0) < PAIR_CACHE_TTL):
         return cached
-    out = {"base_sym": None, "quote_sym": None, "dex_id": None, "_ts": now}
+    out = {"base_sym": None, "quote_sym": None, "base_name": None, "quote_name": None, "dex_id": None, "_ts": now}
     try:
         url = f"{DEX_PAIR_URL}/{pair_id}"
         res = requests.get(url, timeout=15)
@@ -871,14 +858,6 @@ def fetch_pair_meta(pair_id: str) -> Dict[str, Any]:
             PAIR_META_CACHE[pair_id] = out
             return out
         p0 = pairs[0]
-        try:
-            bt = p0.get('baseToken') or {}
-            if isinstance(bt, dict):
-                out['token_name'] = bt.get('name') or out.get('token_name')
-                out['token_symbol'] = bt.get('symbol') or out.get('token_symbol')
-        except:
-            pass
-
         base = p0.get("baseToken") or {}
         quote = p0.get("quoteToken") or {}
         out["base_sym"] = (base.get("symbol") or "").upper() or None
@@ -923,6 +902,16 @@ def ensure_pair_ton_leg(pair_id: str) -> Optional[int]:
         ton_leg = None
     if ton_leg is not None:
         rec["ton_leg"] = ton_leg
+        # Cache token display name from DexScreener (non-TON side) for premium headers
+        try:
+            if isinstance(meta, dict):
+                if ton_leg == 0:
+                    rec["token_name"] = (meta.get("quote_name") or meta.get("quote_sym") or rec.get("symbol") or "").strip() or rec.get("token_name")
+                elif ton_leg == 1:
+                    rec["token_name"] = (meta.get("base_name") or meta.get("base_sym") or rec.get("symbol") or "").strip() or rec.get("token_name")
+        except:
+            pass
+
         # persist quietly
         try:
             save_data()
@@ -1043,14 +1032,6 @@ def fetch_pair_change(pair_id: str, tf: str = "h6") -> Optional[float]:
             return None
 
         p0 = pairs[0]
-        try:
-            bt = p0.get('baseToken') or {}
-            if isinstance(bt, dict):
-                out['token_name'] = bt.get('name') or out.get('token_name')
-                out['token_symbol'] = bt.get('symbol') or out.get('token_symbol')
-        except:
-            pass
-
         pc = p0.get("priceChange") or {}
         if not isinstance(pc, dict):
             return None
@@ -1789,30 +1770,31 @@ def strength_count_from_ton(ton_amt: float) -> int:
 
 
 def build_strength_bar(ton_amt: float) -> str:
-    """Return a wide, premium strength wall using green circles (Maxiton-style).
+    """Return a Maxiton-style green strength wall (wide, premium).
 
-    - 15 icons per line for a wide Telegram bubble
-    - capped so it doesn't become too big
+    - 15 icons per line so the Telegram bubble expands
+    - capped to 2 lines (30 icons) so the alert stays compact
     """
     filled = strength_count_from_ton(ton_amt)
-    icon = "🟢"
+    try:
+        filled = int(filled)
+    except Exception:
+        filled = 0
     if filled <= 0:
         return ""
 
-    # Hard caps
+    icon = "🟢"
     per_line = 15
-    max_icons = 45  # max 3 lines
+    max_icons = 30  # 2 lines max
     filled = min(filled, max_icons)
 
-    icons = [icon] * filled
-    rows: list[str] = []
-    for i in range(0, len(icons), per_line):
-        chunk = icons[i:i + per_line]
-        if chunk:
-            rows.append("".join(chunk))
+    lines: list[str] = []
+    for i in range(0, filled, per_line):
+        n = min(per_line, filled - i)
+        lines.append(icon * n)
 
-    wall = "\n".join(rows)
-    return wall + "\n" if wall else ""
+    wall = "\n".join(lines)
+    return wall + "\n\n"
 
 # ===================== MESSAGE SENDER =====================
 async def post_buy_message(
@@ -1857,36 +1839,44 @@ async def post_buy_message(
         holders_line = f"👥 Holders: <b>{holders_val}</b>\n"
 
         dex_label = (lbl or source_label or "DEX").strip() or "DEX"
-        token_disp = f"<a href='{tg_url}'>{sym}</a>" if tg_url else sym
-        title = f"<b>{token_disp} Buy! — {dex_label}</b>" if dex_label else f"<b>{token_disp} Buy!</b>"
 
-        # Premium Version 1 layout (used for STON.fi + DeDust)
+        # -------- Maxiton-style SpyTON layout (premium, text links) --------
+        token_name = sym
+        try:
+            if isinstance(rec, dict):
+                token_name = (rec.get("token_name") or sym) or sym
+        except:
+            token_name = sym
+        token_name = str(token_name)
+
+        name_safe = html.escape(token_name)
+        sym_safe = html.escape(sym)
+
+        name_part = f"<a href='{tg_url}'>{name_safe}</a>" if tg_url else name_safe
+        sym_part = f"<a href='{tg_url}'>{sym_safe}</a>" if tg_url else sym_safe
+
+        header_line = f"🟩 | {name_part}\n\n"
+        title_line = f"{sym_part} Buy! — {html.escape(dex_label)}\n"
+
+        # Amount lines
         ton_line = f"💎 <b>{ton_amt:.2f} TON</b>{usd_part}\n" if ton_amt > 0 else ""
-        token_line = f"🪙 <b>{token_amt:,.2f} {sym}</b>\n" if token_amt > 0 else ""
+
+        token_amt_txt = ""
+        if token_amt and token_amt > 0:
+            if token_amt >= 1000:
+                token_amt_txt = f"{token_amt:,.0f}"
+            elif token_amt >= 1:
+                token_amt_txt = f"{token_amt:,.2f}"
+            else:
+                token_amt_txt = f"{token_amt:,.6f}".rstrip("0").rstrip(".")
+        token_line = f"🪙 <b>{token_amt_txt} {sym_safe}</b>\n" if token_amt_txt else ""
 
         buyer_part = f"<a href='{buyer_url}'>{short(buyer)}</a>" if buyer_url else short(buyer)
         txn_part = f"<a href='{tx_url}'>Txn</a>" if tx_url else "Txn"
-        wallet_lin        # Maxiton-style SpyTON layout (text-only, premium)
-        token_name = None
-        try:
-            tn = stats.get("token_name") if isinstance(stats, dict) else None
-            token_name = (tn or "").strip() if isinstance(tn, str) else None
-        except:
-            token_name = None
-        if not token_name:
-            token_name = sym
+        wallet_line = f"👤 {buyer_part} | {txn_part}\n"
 
-        dex_label = (lbl or source_label or "DEX").strip() or "DEX"
-
-        name_part = f"<a href='{tg_url}'>{html_escape(token_name)}</a>" if tg_url else html_escape(token_name)
-        sym_part = f"<a href='{tg_url}'>{html_escape(sym)}</a>" if tg_url else html_escape(sym)
-
-        header_line = f"🟩 | {name_part}\n\n"
-        title_line = f"{sym_part} Buy! — {html_escape(dex_label)}\n"
-
-        dtrade_url = ""
-        if token_addr:
-            dtrade_url = f"https://t.me/{DTRADE_BOT_USERNAME}?start={DTRADE_START_PREFIX}{token_addr}"
+        # DTrade deep-link: referral prefix + CA (token address)
+        dtrade_url = f"https://t.me/{DTRADE_BOT_USERNAME}?start={DTRADE_START_PREFIX}{token_addr}" if token_addr else f"https://t.me/{DTRADE_BOT_USERNAME}"
 
         links_line = (
             f"📈 <a href='{chart_url}'>Chart</a> | "
