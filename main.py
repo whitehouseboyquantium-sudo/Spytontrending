@@ -1155,6 +1155,10 @@ def is_ton_asset(asset_obj: Any) -> bool:
     - symbol/ticker is TON
     - it explicitly flags native
     """
+    # Some DeDust endpoints may return TON as a string
+    if isinstance(asset_obj, str):
+        return asset_obj.strip().upper() == "TON"
+
     if not isinstance(asset_obj, dict):
         return False
 
@@ -1200,6 +1204,51 @@ def extract_jetton_master(asset_obj: Any) -> str:
                     return v.strip()
 
     return ""
+
+
+def _dedust_get_obj(t: Dict[str, Any], keys: List[str]) -> Any:
+    """Return the first non-empty object for any of the provided keys."""
+    if not isinstance(t, dict):
+        return None
+    for k in keys:
+        if k in t and t.get(k) is not None:
+            return t.get(k)
+    return None
+
+def _dedust_asset_in(t: Dict[str, Any]) -> Any:
+    obj = _dedust_get_obj(t, ["inAsset","in_asset","assetIn","asset_in","asset_in_obj","in_asset_obj"])
+    if obj is not None:
+        return obj
+    sub = t.get("in") or t.get("from") or t.get("input")
+    if isinstance(sub, dict):
+        return sub.get("asset") or sub.get("token") or sub.get("inAsset") or sub.get("assetIn")
+    return None
+
+def _dedust_asset_out(t: Dict[str, Any]) -> Any:
+    obj = _dedust_get_obj(t, ["outAsset","out_asset","assetOut","asset_out","asset_out_obj","out_asset_obj"])
+    if obj is not None:
+        return obj
+    sub = t.get("out") or t.get("to") or t.get("output")
+    if isinstance(sub, dict):
+        return sub.get("asset") or sub.get("token") or sub.get("outAsset") or sub.get("assetOut")
+    return None
+
+def _dedust_amount_in(t: Dict[str, Any]) -> float:
+    v = _dedust_get_obj(t, ["inAmount","in_amount","amountIn","amount_in","amount_in_value"])
+    if v is None:
+        sub = t.get("in") or t.get("from") or t.get("input")
+        if isinstance(sub, dict):
+            v = sub.get("amount") or sub.get("value") or sub.get("inAmount") or sub.get("amountIn")
+    return _parse_float(v)
+
+def _dedust_amount_out(t: Dict[str, Any]) -> float:
+    v = _dedust_get_obj(t, ["outAmount","out_amount","amountOut","amount_out","amount_out_value"])
+    if v is None:
+        sub = t.get("out") or t.get("to") or t.get("output")
+        if isinstance(sub, dict):
+            v = sub.get("amount") or sub.get("value") or sub.get("outAmount") or sub.get("amountOut")
+    return _parse_float(v)
+
 
 def fetch_holders_count_tonapi(jetton_address: str) -> Optional[int]:
     if not jetton_address:
@@ -3210,18 +3259,39 @@ async def dedust_tracker_job(context: ContextTypes.DEFAULT_TYPE):
                     SEEN_TX_DEDUST[key] = now
                     seen_persist[key] = now
 
-                    # Buy detection: TON -> token
-                    in_amt = _parse_float(t.get("inAmount") or t.get("in_amount") or t.get("amountIn"))
-                    out_amt = _parse_float(t.get("outAmount") or t.get("out_amount") or t.get("amountOut"))
+                    # Buy detection: TON -> token (robust across DeDust schemas)
+                    in_asset = _dedust_asset_in(t) or t.get("inAsset") or t.get("in_asset")
+                    out_asset = _dedust_asset_out(t) or t.get("outAsset") or t.get("out_asset")
+                    in_amt = _dedust_amount_in(t)
+                    out_amt = _dedust_amount_out(t)
+
                     if not in_amt or not out_amt:
                         continue
 
-                    if _is_ton_asset(t.get("inAsset") or t.get("in_asset")):
+                    # Determine direction: TON must be the input asset for a BUY
+                    if is_ton_asset(in_asset):
                         ton_amt = in_amt
                         token_amt = out_amt
-                    else:
-                        # token->TON (sell) or non-TON swap
+                    elif is_ton_asset(out_asset):
+                        # token -> TON (sell)
                         continue
+                    else:
+                        # non-TON swap
+                        continue
+
+                    # Normalize TON if values look like nanoTON
+                    if ton_amt > 1e6:
+                        ton_amt = to_ton_from_nano(ton_amt)
+
+                    # Normalize token amount if values look like nano-jettons
+                    token_addr_guess = rec.get("token") or rec.get("token_addr") or rec.get("jetton") or ""
+                    if token_addr_guess and token_amt > 0:
+                        try:
+                            dec = get_jetton_decimals(token_addr_guess)
+                            if token_amt > 10 ** (dec + 1):
+                                token_amt = token_amt / (10 ** dec)
+                        except Exception:
+                            pass
 
                     sym = rec.get("symbol") or rec.get("ticker") or rec.get("name") or "TOKEN"
                     token_addr = rec.get("token") or rec.get("token_addr") or rec.get("jetton") or ""
