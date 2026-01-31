@@ -130,7 +130,9 @@ LB_MAX_WHALES = int(os.getenv("LB_MAX_WHALES", "10"))
 FAST_POST_MODE = os.getenv("FAST_POST_MODE", "1") == "1"
 # In FAST_POST_MODE, these expensive lookups are moved to the background.
 FAST_STATS_TIMEOUT = float(os.getenv("FAST_STATS_TIMEOUT", "3"))
-FAST_HOLDERS_ENABLED = os.getenv("FAST_HOLDERS_ENABLED", "0") == "1"  # default off (slow)
+# Holders are shown in the premium template. We fetch them in the background and edit the message.
+# Default ON so you don't get "Holders: N/A".
+FAST_HOLDERS_ENABLED = os.getenv("FAST_HOLDERS_ENABLED", "1") == "1"
 
 # -------------------- STON API --------------------
 STON_BASE = "https://api.ston.fi"
@@ -1161,23 +1163,61 @@ def fetch_holders_count_tonapi(jetton_address: str) -> Optional[int]:
     if not TONAPI_KEY or not jetton_address:
         return None
 
-    url = f"{TONAPI_BASE.rstrip('/')}/v2/jettons/{jetton_address}"
-    js = tonapi_get(url)
-    if not js:
-        return None
+    # Cache (avoid rate limits / keep first message non-N/A after we've seen the token once)
+    # {addr: (holders, ts)}
+    global HOLDERS_CACHE
+    try:
+        HOLDERS_CACHE
+    except NameError:
+        HOLDERS_CACHE = {}
 
-    for k in ("holders_count", "holdersCount"):
-        v = js.get(k)
-        if isinstance(v, int):
-            return v
-        if isinstance(v, str) and v.isdigit():
-            return int(v)
+    now = time.time()
+    cached = HOLDERS_CACHE.get(jetton_address)
+    if isinstance(cached, tuple) and len(cached) == 2:
+        hv, ts = cached
+        if isinstance(hv, int) and (now - float(ts)) < 10 * 60:
+            return hv
 
-    stats = js.get("stats")
-    if isinstance(stats, dict):
-        v = stats.get("holders_count") or stats.get("holdersCount")
-        if isinstance(v, int):
-            return v
+    # 1) Primary: jetton details endpoint
+    js = tonapi_get(f"{TONAPI_BASE.rstrip('/')}/v2/jettons/{jetton_address}")
+    if isinstance(js, dict):
+        for k in ("holders_count", "holdersCount", "holders", "holdersCountTotal"):
+            v = js.get(k)
+            if isinstance(v, int):
+                HOLDERS_CACHE[jetton_address] = (v, now)
+                return v
+            if isinstance(v, str) and v.isdigit():
+                hv = int(v)
+                HOLDERS_CACHE[jetton_address] = (hv, now)
+                return hv
+
+        stats = js.get("stats")
+        if isinstance(stats, dict):
+            for k in ("holders_count", "holdersCount", "holders"):
+                v = stats.get(k)
+                if isinstance(v, int):
+                    HOLDERS_CACHE[jetton_address] = (v, now)
+                    return v
+                if isinstance(v, str) and v.isdigit():
+                    hv = int(v)
+                    HOLDERS_CACHE[jetton_address] = (hv, now)
+                    return hv
+
+    # 2) Fallback: holders list endpoint usually returns a total
+    js2 = tonapi_get(
+        f"{TONAPI_BASE.rstrip('/')}/v2/jettons/{jetton_address}/holders",
+        params={"limit": 1, "offset": 0},
+    )
+    if isinstance(js2, dict):
+        for k in ("total", "total_count", "totalCount", "count"):
+            v = js2.get(k)
+            if isinstance(v, int):
+                HOLDERS_CACHE[jetton_address] = (v, now)
+                return v
+            if isinstance(v, str) and v.isdigit():
+                hv = int(v)
+                HOLDERS_CACHE[jetton_address] = (hv, now)
+                return hv
 
     return None
 
@@ -1667,23 +1707,24 @@ def tg_emoji(emoji_id: str, fallback: str) -> str:
 def strength_count_from_ton(ton_amt: float) -> int:
     """Map TON amount to a premium strength wall size (compact).
 
-    - 12 symbols per line
-    - Usually 1–2 lines, 3 lines only for whales
-    - Hard cap at 36 symbols so alerts don't get too big
+    Wide-wall version (premium look):
+    - 20 symbols per line (matches the "expanded" look in your reference bot)
+    - 1–3 lines max
+    - Hard cap at 60 symbols so alerts don't get too big
     """
     try:
         t = float(ton_amt or 0.0)
     except Exception:
         t = 0.0
 
-    # Compact tiers (keeps template premium but not massive)
+    # Wide-wall tiers (keeps the bubble wide while staying compact)
     if t < 2:
-        return 12          # 1 line
+        return 20          # 1 line
     if t < 10:
-        return 24          # 2 lines
+        return 40          # 2 lines
     if t < 25:
-        return 30          # 2.5 lines (2 lines + 6)
-    return 36              # 3 lines (cap)
+        return 50          # 2.5 lines
+    return 60              # 3 lines (cap)
 
 
 def build_strength_bar(ton_amt: float) -> str:
@@ -1693,7 +1734,7 @@ def build_strength_bar(ton_amt: float) -> str:
     icons = [icon] * filled
 
     lines = []
-    per_line = 12
+    per_line = 20
     for i in range(0, len(icons), per_line):
         chunk = icons[i:i + per_line]
         if chunk:
