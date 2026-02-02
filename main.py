@@ -103,6 +103,8 @@ DEDUST_API_BASE = os.getenv("DEDUST_API_BASE", "https://api.dedust.io").rstrip("
 
 # Poll intervals (seconds)
 STON_POLL_INTERVAL = int(os.getenv("STON_POLL_INTERVAL", "2"))
+STON_FAST_POLL_INTERVAL = int(os.getenv("STON_FAST_POLL_INTERVAL", "2"))
+STON_TONAPI_LIMIT = int(os.getenv("STON_TONAPI_LIMIT", "25" if TONAPI_KEY else "12"))
 DEDUST_POLL_INTERVAL = int(os.getenv("DEDUST_POLL_INTERVAL", "3"))
 LB_UPDATE_INTERVAL = int(os.getenv("LB_UPDATE_INTERVAL", "60"))
 AUTO_RANK_INTERVAL = int(os.getenv("AUTO_RANK_INTERVAL", "30"))
@@ -1429,9 +1431,8 @@ def stonfi_extract_buys_from_tonapi_tx(tx: Dict[str, Any], token_addr: str) -> L
     return out
 
 async def ston_tracker_job_fast(context: ContextTypes.DEFAULT_TYPE):
-    """FAST STON tracker using TonAPI pool transactions (lower latency than export feed)."""
-    if not TONAPI_KEY:
-        return
+    """FAST STON tracker using TonAPI pool transactions (lower latency; supports STON.fi v2)."""
+    # TonAPI can work without a key (rate-limited). We still try.
 
     try:
         cleanup_seen()
@@ -1458,11 +1459,11 @@ async def ston_tracker_job_fast(context: ContextTypes.DEFAULT_TYPE):
         if not pools:
             return
 
-        sem = asyncio.Semaphore(int(os.getenv("STON_CONCURRENCY", "16")))
+        sem = asyncio.Semaphore(int(os.getenv("STON_CONCURRENCY", "16" if TONAPI_KEY else "6")))
 
         async def _fetch_pool(pool_addr: str):
             async with sem:
-                txs = await _to_thread(tonapi_account_transactions, pool_addr, 25)
+                txs = await _to_thread(tonapi_account_transactions, pool_addr, STON_TONAPI_LIMIT)
                 return pool_addr, txs
 
         fetch_tasks = [asyncio.create_task(_fetch_pool(p[0])) for p in pools]
@@ -1522,10 +1523,14 @@ async def ston_tracker_job_fast(context: ContextTypes.DEFAULT_TYPE):
                     txh = (buy.get("tx") or "").strip()
                     if not txh:
                         continue
-                    seen_key = f"ston:{pool_addr}:{txh}"
-                    if seen_key in SEEN_TX_STON:
+                    key_pool = f"ston:{pool_addr}:{txh}"
+                    key_plain = f"ston:{txh}"
+                    if key_pool in SEEN_TX_STON or key_plain in SEEN_TX_STON or txh in SEEN_TX_STON:
                         continue
-                    SEEN_TX_STON[seen_key] = time.time()
+                    _ts = time.time()
+                    SEEN_TX_STON[key_pool] = _ts
+                    SEEN_TX_STON[key_plain] = _ts
+                    SEEN_TX_STON[txh] = _ts
 
                     buyer = (buy.get("buyer") or "").strip()
                     ton_amt = safe_float(buy.get("ton"))
@@ -2312,6 +2317,12 @@ async def memepad_activation_job(context: ContextTypes.DEFAULT_TYPE):
             "buyers": old.get("buyers", {}) if isinstance(old.get("buyers"), dict) else {},
         }
 
+        # Keep a dedicated DeDust pools map for older tracker code
+        if dex == "dedust":
+            DATA.setdefault("dedust_pools", {})
+            if isinstance(DATA.get("dedust_pools"), dict):
+                DATA["dedust_pools"][pair_id] = DATA["pairs"][pair_id]
+
         # Update any group mirrors watching this token
         mirrors = DATA.get("group_mirrors", {})
         if isinstance(mirrors, dict):
@@ -2353,8 +2364,7 @@ async def memepad_activation_job(context: ContextTypes.DEFAULT_TYPE):
 async def blum_early_tracker_job(context: ContextTypes.DEFAULT_TYPE):
     if not BLUM_EARLY_ENABLED:
         return
-    if not TONAPI_KEY:
-        return
+    # TonAPI can work without a key (rate-limited). We still try.
 
     cleanup_seen()
     load_data()
@@ -2786,6 +2796,12 @@ async def addtoken(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "pool": pair_id,
         "buyers": old.get("buyers", {}) if isinstance(old.get("buyers"), dict) else {},
     }
+    # Keep a dedicated DeDust pools map for older tracker code
+    if dex == "dedust":
+        DATA.setdefault("dedust_pools", {})
+        if isinstance(DATA.get("dedust_pools"), dict):
+            DATA["dedust_pools"][pair_id] = DATA["pairs"][pair_id]
+
     # If configured inside a group, store mirror settings for that group
     if chat and chat.type in ("group", "supergroup"):
         DATA.setdefault("group_mirrors", {})
@@ -3096,7 +3112,8 @@ async def ston_tracker_job(context: ContextTypes.DEFAULT_TYPE):
                 continue
 
             tx = buy.get("tx") or ""
-            if not tx or tx in SEEN_TX_STON:
+            key_plain = f"ston:{tx}"
+            if not tx or tx in SEEN_TX_STON or key_plain in SEEN_TX_STON:
                 continue
 
             pair_id = buy["pair_id"]
@@ -3119,7 +3136,9 @@ async def ston_tracker_job(context: ContextTypes.DEFAULT_TYPE):
                 buyers_map[buyer] = int(buyers_map.get(buyer, 0)) + 1
                 save_data()
 
-            SEEN_TX_STON[tx] = time.time()
+            _ts = time.time()
+            SEEN_TX_STON[tx] = _ts
+            SEEN_TX_STON[key_plain] = _ts
 
             # Post message with header
             await post_buy_message(
@@ -3159,7 +3178,18 @@ async def dedust_tracker_job(context: ContextTypes.DEFAULT_TYPE):
     async with DEDUST_POLL_LOCK:
         try:
             pools = DATA.get("dedust_pools") or {}
-            if not isinstance(pools, dict) or not pools:
+            if not isinstance(pools, dict):
+                pools = {}
+
+            # Back-compat: older configs store DeDust pools inside DATA["pairs"]
+            if not pools:
+                pairs = DATA.get("pairs") or {}
+                if isinstance(pairs, dict):
+                    for pool_addr, rec in pairs.items():
+                        if isinstance(rec, dict) and str(rec.get("dex", "")).lower() == "dedust":
+                            pools[pool_addr] = rec
+
+            if not pools:
                 return
 
             last_id_map: Dict[str, str] = STATE.get("dedust_last_id", {}) if isinstance(STATE.get("dedust_last_id"), dict) else {}
@@ -3425,7 +3455,8 @@ def main():
             bot.job_queue.run_repeating(update_leaderboard, interval=LB_UPDATE_INTERVAL, first=10)
 
             # Trackers
-            bot.job_queue.run_repeating(ston_tracker_job, interval=STON_POLL_INTERVAL, first=2)
+            bot.job_queue.run_repeating(ston_tracker_job_fast, interval=STON_FAST_POLL_INTERVAL, first=2)
+            bot.job_queue.run_repeating(ston_tracker_job, interval=STON_POLL_INTERVAL, first=4)
             bot.job_queue.run_repeating(dedust_tracker_job, interval=DEDUST_POLL_INTERVAL, first=5)
             bot.job_queue.run_repeating(memepad_activation_job, interval=MEMEPAD_ACTIVATION_INTERVAL, first=10)
             bot.job_queue.run_repeating(blum_early_tracker_job, interval=BLUM_POLL_INTERVAL, first=12)
