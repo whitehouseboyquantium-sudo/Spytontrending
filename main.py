@@ -1557,6 +1557,134 @@ async def ston_tracker_job_fast(context: ContextTypes.DEFAULT_TYPE):
         log.exception("ston_tracker_job_fast error: %s", e)
 
 
+async def dedust_tracker_job_fast(context: ContextTypes.DEFAULT_TYPE):
+    """FAST DeDust tracker using TonAPI pool transactions (lower latency; more reliable than DeDust API)."""
+    try:
+        cleanup_seen()
+        load_data()
+        load_state()
+
+        last_lt_map = STATE.get("dedust_last_lt_map")
+        if not isinstance(last_lt_map, dict):
+            last_lt_map = {}
+            STATE["dedust_last_lt_map"] = last_lt_map
+
+        pools = []
+        for pool, rec in (DATA.get("pairs") or {}).items():
+            if not isinstance(rec, dict):
+                continue
+            if str(rec.get("dex", "")).lower() != "dedust":
+                continue
+            token_addr = (rec.get("token_address") or rec.get("token") or rec.get("token_addr") or rec.get("jetton") or "").strip()
+            pools.append((pool, rec, token_addr))
+
+        if not pools:
+            return
+
+        limit = int(os.getenv("DEDUST_TONAPI_LIMIT", "12" if TONAPI_KEY else "8"))
+        sem = asyncio.Semaphore(int(os.getenv("DEDUST_CONCURRENCY", "14" if TONAPI_KEY else "5")))
+
+        async def _fetch_pool(pool_addr: str):
+            async with sem:
+                txs = await _to_thread(tonapi_account_transactions, pool_addr, limit)
+                return pool_addr, txs
+
+        results = await asyncio.gather(*[asyncio.create_task(_fetch_pool(p[0])) for p in pools], return_exceptions=True)
+        txs_by_pool: Dict[str, List[Dict[str, Any]]] = {}
+        for r in results:
+            if isinstance(r, Exception):
+                continue
+            pool_addr, txs = r
+            if isinstance(pool_addr, str) and isinstance(txs, list):
+                txs_by_pool[pool_addr] = [t for t in txs if isinstance(t, dict)]
+
+        for pool_addr, rec, token_addr in pools:
+            txs = txs_by_pool.get(pool_addr) or []
+            if not txs:
+                continue
+
+            last_lt = last_lt_map.get(pool_addr, 0)
+            try:
+                last_lt = int(last_lt) if str(last_lt).isdigit() else int(last_lt or 0)
+            except Exception:
+                last_lt = 0
+
+            newest_lt = 0
+            fresh_txs = []
+            for tx in txs:  # newest first
+                lt = _tx_lt(tx)
+                if lt > newest_lt:
+                    newest_lt = lt
+                if last_lt and lt <= last_lt:
+                    continue
+                fresh_txs.append(tx)
+
+            if newest_lt:
+                last_lt_map[pool_addr] = newest_lt
+                save_state()
+
+            if not fresh_txs:
+                continue
+
+            # oldest -> newest
+            fresh_txs.sort(key=_tx_lt)
+
+            sym = (rec.get("symbol") or rec.get("ticker") or rec.get("name") or "TOKEN").strip().upper()
+            buyer_map = rec.get("buyers")
+            if not isinstance(buyer_map, dict):
+                buyer_map = {}
+                rec["buyers"] = buyer_map
+
+            for tx in fresh_txs:
+                buys = dedust_extract_buys_from_tonapi_tx(tx, token_addr)
+                if not buys:
+                    continue
+                for buy in buys:
+                    txh = (buy.get("tx") or "").strip() or _tx_hash(tx)
+                    if not txh:
+                        continue
+                    key_pool = f"dedust:{pool_addr}:{txh}"
+                    key_plain = f"dedust:{txh}"
+                    if key_pool in SEEN_TX_DEDUST or key_plain in SEEN_TX_DEDUST or txh in SEEN_TX_DEDUST:
+                        continue
+                    _ts = time.time()
+                    SEEN_TX_DEDUST[key_pool] = _ts
+                    SEEN_TX_DEDUST[key_plain] = _ts
+                    SEEN_TX_DEDUST[txh] = _ts
+
+                    buyer = (buy.get("buyer") or "").strip()
+                    ton_amt = safe_float(buy.get("ton"))
+                    token_amt = safe_float(buy.get("token_amt"))
+
+                    # normalize token amount if looks like nano-jettons
+                    if token_addr and token_amt > 0:
+                        try:
+                            dec = get_jetton_decimals(token_addr)
+                            if token_amt > 10 ** (dec + 1):
+                                token_amt = token_amt / (10 ** dec)
+                        except Exception:
+                            pass
+
+                    pos_txt = "New Holder!" if buyer and buyer not in buyer_map else "Existing Holder"
+                    if buyer:
+                        buyer_map[buyer] = int(buyer_map.get(buyer, 0)) + 1
+                        save_data()
+
+                    await post_buy_message(
+                        context=context,
+                        sym=sym,
+                        token_addr=token_addr,
+                        pair_id=pool_addr,
+                        buyer=buyer,
+                        tx_hash=txh,
+                        ton_amt=ton_amt,
+                        token_amt=token_amt,
+                        pos_txt=pos_txt,
+                        source_label=(rec.get("dex_label") or "DeDust"),
+                    )
+    except Exception as e:
+        log.exception("dedust_tracker_job_fast error: %s", e)
+
 # ===================== BUY DETECTION: STON =====================
 
 # ===================== BUY DETECTION: STON =====================
@@ -1626,53 +1754,103 @@ def _action_type(a: Dict[str, Any]) -> str:
     t = a.get("type") or a.get("action") or a.get("name") or ""
     return str(t)
 
-def dedust_extract_buys_from_tonapi_tx(tx: Dict[str, Any], pool: str) -> List[Dict[str, Any]]:
+def dedust_extract_buys_from_tonapi_tx(tx: Dict[str, Any], token_addr: str) -> List[Dict[str, Any]]:
+    """Extract BUY swaps for a given jetton from TonAPI tx actions.
+
+    BUY = TON -> token_addr.
+    Filters swaps to DeDust when TonAPI provides dex metadata.
+    """
     out: List[Dict[str, Any]] = []
 
-    tx_hash = (tx.get("hash") or tx.get("transaction_id") or tx.get("id") or "").strip()
-    if not tx_hash:
-        tid = tx.get("transaction_id")
-        if isinstance(tid, dict):
-            tx_hash = (tid.get("hash") or "").strip()
+    tx_hash = _tx_hash(tx)
 
     actions = tx.get("actions")
     if not isinstance(actions, list):
         actions = []
 
-    if actions:
-        for a in actions:
-            if not isinstance(a, dict):
+    for a in actions:
+        if not isinstance(a, dict):
+            continue
+
+        at = _action_type(a).lower()
+        if "swap" not in at and "dex" not in at:
+            continue
+
+        # If TonAPI provides dex metadata, require it to be DeDust.
+        dex = a.get("dex")
+        dex_name = ""
+        if isinstance(dex, dict):
+            dex_name = str(dex.get("name") or dex.get("title") or dex.get("id") or "").lower()
+        if dex_name and "dedust" not in dex_name and "de dust" not in dex_name:
+            continue
+
+        buyer = (
+            a.get("user")
+            or a.get("sender")
+            or a.get("initiator")
+            or a.get("from")
+            or a.get("account")
+        )
+        if isinstance(buyer, dict):
+            buyer = buyer.get("address") or buyer.get("account") or buyer.get("wallet")
+
+        # Common numeric fields
+        ton_in = a.get("ton_in") or a.get("tonIn") or a.get("in_ton") or a.get("inTon") or a.get("amount_ton_in")
+        jet_out = a.get("jetton_out") or a.get("jettonOut") or a.get("out_jetton") or a.get("outJetton") or a.get("amount_jetton_out")
+
+        # Nested asset shapes
+        asset_in = a.get("assetIn") or a.get("asset_in") or a.get("inAsset") or a.get("in_asset")
+        asset_out = a.get("assetOut") or a.get("asset_out") or a.get("outAsset") or a.get("out_asset")
+
+        # Determine out jetton master if present
+        out_master = (
+            a.get("jetton_master")
+            or a.get("jettonMaster")
+            or a.get("jetton")
+        )
+        if isinstance(out_master, dict):
+            out_master = out_master.get("address") or out_master.get("master") or out_master.get("jetton_master")
+
+        if not out_master and isinstance(asset_out, dict):
+            out_master = extract_jetton_master(asset_out)
+
+        # Determine in/out amounts if not in ton_in/jet_out
+        amt_in = a.get("amount_in") or a.get("amountIn") or a.get("in_amount") or a.get("inAmount") or ton_in
+        amt_out = a.get("amount_out") or a.get("amountOut") or a.get("out_amount") or a.get("outAmount") or jet_out
+
+        # Require TON input
+        if ton_in is None and not is_ton_asset(asset_in):
+            continue
+        # Require token output match if available
+        if token_addr:
+            if out_master and out_master != token_addr:
                 continue
-            at = _action_type(a).lower()
 
-            if "swap" not in at and "dex" not in at:
-                continue
+        ton_spent = 0.0
+        if amt_in is not None:
+            if isinstance(amt_in, (int, float)):
+                ton_spent = to_ton_from_nano(amt_in) if float(amt_in) > 1e6 else float(amt_in)
+            elif isinstance(amt_in, str):
+                if amt_in.isdigit():
+                    ton_spent = to_ton_from_nano(amt_in)
+                else:
+                    ton_spent = safe_float(amt_in)
 
-            buyer = (
-                a.get("user")
-                or a.get("sender")
-                or a.get("initiator")
-                or (a.get("source") if isinstance(a.get("source"), str) else None)
-            )
+        token_received = 0.0
+        if amt_out is not None:
+            if isinstance(amt_out, (int, float)):
+                token_received = float(amt_out)
+            elif isinstance(amt_out, str):
+                token_received = float(amt_out) if amt_out.replace(".","",1).isdigit() else safe_float(amt_out)
 
-            if isinstance(buyer, dict):
-                buyer = buyer.get("address") or buyer.get("account") or buyer.get("wallet")
+        if ton_spent <= 0 or token_received <= 0:
+            continue
+        if not isinstance(buyer, str) or not buyer:
+            buyer = ""
 
-            ton_in = a.get("ton_in") or a.get("tonIn") or a.get("in_ton") or a.get("inTon")
-            jet_out = a.get("jetton_out") or a.get("jettonOut") or a.get("out_jetton") or a.get("outJetton")
+        out.append({"buyer": buyer, "ton": ton_spent, "token_amt": token_received, "tx": tx_hash})
 
-            ton_spent = 0.0
-            if ton_in is not None:
-                ton_spent = to_ton_from_nano(ton_in) if str(ton_in).isdigit() else safe_float(ton_in)
-
-            token_received = safe_float(jet_out) if jet_out is not None else 0.0
-
-            if ton_spent > 0 and token_received > 0 and isinstance(buyer, str) and buyer:
-                out.append({"buyer": buyer, "ton": ton_spent, "token_amt": token_received, "tx": tx_hash})
-        if out:
-            return out
-
-    return []
+    return out
 
 # ===================== BUY DETECTION: BLUM (EARLY) =====================
 def blum_extract_buys_from_jetton_master_tx(tx: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -3457,7 +3635,8 @@ def main():
             # Trackers
             bot.job_queue.run_repeating(ston_tracker_job_fast, interval=STON_FAST_POLL_INTERVAL, first=2)
             bot.job_queue.run_repeating(ston_tracker_job, interval=STON_POLL_INTERVAL, first=4)
-            bot.job_queue.run_repeating(dedust_tracker_job, interval=DEDUST_POLL_INTERVAL, first=5)
+            bot.job_queue.run_repeating(dedust_tracker_job_fast, interval=int(os.getenv("DEDUST_FAST_POLL_INTERVAL", "2")), first=3)
+            bot.job_queue.run_repeating(dedust_tracker_job, interval=DEDUST_POLL_INTERVAL, first=6)
             bot.job_queue.run_repeating(memepad_activation_job, interval=MEMEPAD_ACTIVATION_INTERVAL, first=10)
             bot.job_queue.run_repeating(blum_early_tracker_job, interval=BLUM_POLL_INTERVAL, first=12)
 
