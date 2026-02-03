@@ -3352,15 +3352,22 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     load_state()
     watch_count = len(DATA.get("watch", {})) if isinstance(DATA.get("watch"), dict) else 0
     approved_blum = 0
+    approved_gaspump = 0
     if isinstance(DATA.get("watch"), dict):
         for _wid, r in DATA["watch"].items():
-            if isinstance(r, dict) and (r.get("source") == "blum") and r.get("approved_early"):
+            if not isinstance(r, dict):
+                continue
+            src = str(r.get("source") or "").lower()
+            if src == "blum" and r.get("approved_early"):
                 approved_blum += 1
+            if src == "gaspump" and r.get("approved_early"):
+                approved_gaspump += 1
 
     await update.message.reply_text(
         f"Tracked pairs: {len(DATA.get('pairs',{}))}\n"
         f"Watchlist: {watch_count}\n"
         f"Blum approved: {approved_blum}\n"
+        f"GasPump approved: {approved_gaspump}\n"
         f"Leaderboard: {'SET' if STATE.get('leaderboard_msg_id') else 'NOT SET'}\n"
         f"STON last block: {STATE.get('ston_last_block') if STATE.get('ston_last_block') is not None else 'NOT SET'}\n"
         f"Events pulled last: {LAST_EVENTS_COUNT}\n"
@@ -3370,6 +3377,7 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"DeDust enabled: {'YES' if DEDUST_ENABLED else 'NO'}\n"
         f"DeDust pools tracked: {sum(1 for _pid, rec in DATA.get('pairs', {}).items() if str(rec.get('dex','')).lower()=='dedust')}\n"
         f"Blum early enabled: {'YES' if BLUM_EARLY_ENABLED else 'NO'}\n"
+        f"GasPump early enabled: {'YES' if GASPUMP_EARLY_ENABLED else 'NO'}\n"
         f"\nLeaderboard filters:\n"
         f"LB_MIN_LIQ_USD: {LB_MIN_LIQ_USD}\n"
         f"LB_MIN_MC_USD: {LB_MIN_MC_USD}\n"
