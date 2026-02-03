@@ -117,9 +117,13 @@ MEMEPAD_ACTIVATION_INTERVAL = int(os.getenv("MEMEPAD_ACTIVATION_INTERVAL", "45")
 # If a WATCH entry is source=blum AND approved_early=True AND token_address is set,
 # bot will post early buys by scanning TONAPI transactions on the jetton master.
 BLUM_EARLY_ENABLED = os.getenv("BLUM_EARLY_ENABLED", "1") == "1"
+GASPUMP_EARLY_ENABLED = os.getenv("GASPUMP_EARLY_ENABLED", "1") == "1"
 BLUM_POLL_LIMIT = int(os.getenv("BLUM_POLL_LIMIT", "12"))  # txs pulled per jetton per poll
+GASPUMP_POLL_LIMIT = int(os.getenv("GASPUMP_POLL_LIMIT", "12"))  # txs pulled per jetton per poll
 BLUM_POLL_INTERVAL = int(os.getenv("BLUM_POLL_INTERVAL", "14"))  # seconds
+GASPUMP_POLL_INTERVAL = int(os.getenv("GASPUMP_POLL_INTERVAL", "10"))  # seconds
 BLUM_DEBUG = os.getenv("BLUM_DEBUG", "0") == "1"
+GASPUMP_DEBUG = os.getenv("GASPUMP_DEBUG", "0") == "1"
 
 # -------------------- LEADERBOARD FILTERS / MODES --------------------
 LB_MIN_LIQ_USD = float(os.getenv("LB_MIN_LIQ_USD", "0"))
@@ -166,6 +170,7 @@ LAST_EVENTS_COUNT: int = 0
 SEEN_TX_STON: Dict[str, float] = {}
 SEEN_TX_DEDUST: Dict[str, float] = {}
 SEEN_TX_BLUM: Dict[str, float] = {}
+SEEN_TX_GASPUMP: Dict[str, float] = {}
 SEEN_TTL_SECONDS = 3600
 
 
@@ -173,6 +178,7 @@ SEEN_TTL_SECONDS = 3600
 DEDUST_POLL_LOCK = asyncio.Lock()
 STON_POLL_LOCK = asyncio.Lock()
 BLUM_POLL_LOCK = asyncio.Lock()
+GASPUMP_POLL_LOCK = asyncio.Lock()
 PAIR_CACHE: Dict[str, Dict[str, Any]] = {}
 PAIR_CACHE_TTL = 30
 
@@ -533,7 +539,7 @@ def save_state():
 
 def cleanup_seen():
     now = time.time()
-    for cache in (SEEN_TX_STON, SEEN_TX_DEDUST, SEEN_TX_BLUM):
+    for cache in (SEEN_TX_STON, SEEN_TX_DEDUST, SEEN_TX_BLUM, SEEN_TX_GASPUMP):
         old = [k for k, ts in cache.items() if now - ts > SEEN_TTL_SECONDS]
         for k in old:
             cache.pop(k, None)
@@ -2700,6 +2706,122 @@ async def blum_early_tracker_job(context: ContextTypes.DEFAULT_TYPE):
     if changed:
         save_data()
 
+
+# ===================== JOB: GASPUMP EARLY TRACKER (NEW) =====================
+
+async def gaspump_early_tracker_job(context: ContextTypes.DEFAULT_TYPE):
+    if not GASPUMP_EARLY_ENABLED:
+        return
+
+    async with GASPUMP_POLL_LOCK:
+        cleanup_seen()
+        load_data()
+        load_state()
+
+        watch = DATA.get("watch", {})
+        if not isinstance(watch, dict) or not watch:
+            return
+
+        gaspump_last_lt = STATE.get("gaspump_last_lt", {})
+        if not isinstance(gaspump_last_lt, dict):
+            gaspump_last_lt = {}
+            STATE["gaspump_last_lt"] = gaspump_last_lt
+
+        changed = False
+
+        for wid, rec in watch.items():
+            if not isinstance(rec, dict):
+                continue
+            if (rec.get("source") or "").lower() != "gaspump":
+                continue
+            if not rec.get("approved_early", False):
+                continue
+
+            token_addr = (rec.get("token_address") or "").strip()
+            if not token_addr:
+                continue
+
+            sym = (rec.get("symbol") or "?").strip().upper()
+
+            txs = await _to_thread(tonapi_account_transactions, token_addr, GASPUMP_POLL_LIMIT)
+            if not txs:
+                continue
+
+            last_lt = safe_int(gaspump_last_lt.get(token_addr)) or 0
+
+            parsed: List[Tuple[int, str, Dict[str, Any]]] = []
+            for tx in txs:
+                lt_i = _tx_lt(tx) or 0
+                h = _tx_hash(tx) or ""
+                parsed.append((lt_i, str(h), tx))
+
+            parsed.sort(key=lambda x: x[0])
+
+            newest_seen_lt = last_lt
+
+            for lt_i, h, tx in parsed:
+                if lt_i and lt_i <= last_lt:
+                    continue
+
+                key = f"GASPUMP:{token_addr}:{h or lt_i}"
+                if key in SEEN_TX_GASPUMP:
+                    continue
+                SEEN_TX_GASPUMP[key] = time.time()
+
+                if GASPUMP_DEBUG:
+                    print(f"[GASPUMP] jetton={token_addr} lt={lt_i} hash={h}")
+
+                # GasPump early trades are memepad-style; reuse the same extractor
+                buys = blum_extract_buys_from_jetton_master_tx(tx)
+                if not buys:
+                    newest_seen_lt = max(newest_seen_lt, lt_i or newest_seen_lt)
+                    continue
+
+                buyers_map = rec.get("buyers")
+                if not isinstance(buyers_map, dict):
+                    buyers_map = {}
+                    rec["buyers"] = buyers_map
+
+                for b in buys:
+                    buyer = (b.get("buyer") or "").strip()
+                    token_amt = float(b.get("token_amt") or 0.0)
+                    ton_amt = float(b.get("ton") or 0.0)
+                    tx_hash = (b.get("tx") or h or "").strip()
+
+                    if not buyer or token_amt <= 0:
+                        continue
+
+                    is_new = buyer not in buyers_map
+                    buyers_map[buyer] = int(buyers_map.get(buyer, 0)) + 1
+                    pos_txt = "New Holder!" if is_new else "Existing Holder"
+
+                    await post_buy_message(
+                        context=context,
+                        sym=sym,
+                        token_addr=token_addr,
+                        pair_id=token_addr,  # early mode
+                        buyer=buyer,
+                        tx_hash=tx_hash,
+                        ton_amt=ton_amt,
+                        token_amt=token_amt,
+                        pos_txt=pos_txt,
+                        source_label="GasPump",
+                    )
+
+                    rec["last_buy_ts"] = int(time.time())
+                    changed = True
+
+                newest_seen_lt = max(newest_seen_lt, lt_i or newest_seen_lt)
+
+            if newest_seen_lt and newest_seen_lt > last_lt:
+                gaspump_last_lt[token_addr] = newest_seen_lt
+                STATE["gaspump_last_lt"] = gaspump_last_lt
+                save_state()
+
+        if changed:
+            save_data()
+
+
 # ===================== COMMANDS =====================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
@@ -2951,7 +3073,7 @@ async def addtoken(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "blum_slug": blum_slug,
             "telegram": tg_link,
             "raw": raw_input,
-            "approved_early": False,  # NEW (approve once for early blum)
+            "approved_early": (True if (chat and chat.type not in ("group","supergroup") and source in ("blum","gaspump") and is_admin(uid)) else False),  # NEW (auto for channel/admin)
             "added_ts": int(time.time()),
         }
         save_data()
@@ -3673,6 +3795,7 @@ def main():
             bot.job_queue.run_repeating(dedust_tracker_job, interval=DEDUST_POLL_INTERVAL, first=6)
             bot.job_queue.run_repeating(memepad_activation_job, interval=MEMEPAD_ACTIVATION_INTERVAL, first=10)
             bot.job_queue.run_repeating(blum_early_tracker_job, interval=BLUM_POLL_INTERVAL, first=12)
+            bot.job_queue.run_repeating(gaspump_early_tracker_job, interval=GASPUMP_POLL_INTERVAL, first=13)
 
             print("🟢 SpyTON Detector running…")
             bot.run_polling()
