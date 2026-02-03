@@ -1315,12 +1315,30 @@ def fetch_holders_count_tonapi(jetton_address: str) -> Optional[int]:
     return None
 
 def tonapi_account_transactions(address: str, limit: int = 10) -> List[Dict[str, Any]]:
+    """Return raw account transactions from TonAPI.
+    Note: this endpoint often does NOT include decoded `actions`.
+    Kept for backward compatibility; prefer `tonapi_account_events` for buy tracking.
+    """
     url = f"{TONAPI_BASE.rstrip('/')}/v2/blockchain/accounts/{address}/transactions"
     js = tonapi_get(url, params={"limit": limit})
     txs = js.get("transactions") if js else None
     if isinstance(txs, list):
         return [t for t in txs if isinstance(t, dict)]
     return []
+
+def tonapi_account_events(address: str, limit: int = 10) -> List[Dict[str, Any]]:
+    """Return account events from TonAPI.
+    Events include decoded `actions` which we use to detect DEX swaps reliably.
+    """
+    url = f"{TONAPI_BASE.rstrip('/')}/v2/accounts/{address}/events"
+    js = tonapi_get(url, params={"limit": limit})
+    evs = None
+    if isinstance(js, dict):
+        evs = js.get("events") or js.get("data") or js.get("result")
+    if isinstance(evs, list):
+        return [e for e in evs if isinstance(e, dict)]
+    return []
+
 
 # ===================== BUY DETECTION: STON (TONAPI FAST PATH) =====================
 def _tx_lt(tx: Dict[str, Any]) -> int:
@@ -1340,7 +1358,7 @@ def _tx_lt(tx: Dict[str, Any]) -> int:
     return 0
 
 def _tx_hash(tx: Dict[str, Any]) -> str:
-    h = (tx.get("hash") or tx.get("id") or "").strip()
+    h = str((tx.get("hash") or tx.get("event_id") or tx.get("id") or "")).strip()
     if not h:
         tid = tx.get("transaction_id")
         if isinstance(tid, dict):
@@ -1586,7 +1604,7 @@ async def dedust_tracker_job_fast(context: ContextTypes.DEFAULT_TYPE):
 
         async def _fetch_pool(pool_addr: str):
             async with sem:
-                txs = await _to_thread(tonapi_account_transactions, pool_addr, limit)
+                txs = await _to_thread(tonapi_account_events, pool_addr, limit)
                 return pool_addr, txs
 
         results = await asyncio.gather(*[asyncio.create_task(_fetch_pool(p[0])) for p in pools], return_exceptions=True)
@@ -1609,25 +1627,35 @@ async def dedust_tracker_job_fast(context: ContextTypes.DEFAULT_TYPE):
             except Exception:
                 last_lt = 0
 
-            newest_lt = 0
+            def _cursor(t: Dict[str, Any]) -> int:
+                lt = _tx_lt(t)
+                if lt:
+                    return lt
+                ts = t.get("timestamp") or t.get("utime") or t.get("time") or 0
+                try:
+                    return int(ts)
+                except Exception:
+                    return 0
+
+            newest_cur = 0
             fresh_txs = []
             for tx in txs:  # newest first
-                lt = _tx_lt(tx)
-                if lt > newest_lt:
-                    newest_lt = lt
-                if last_lt and lt <= last_lt:
+                cur = _cursor(tx)
+                if cur > newest_cur:
+                    newest_cur = cur
+                if last_lt and cur and cur <= last_lt:
                     continue
                 fresh_txs.append(tx)
 
-            if newest_lt:
-                last_lt_map[pool_addr] = newest_lt
+            if newest_cur:
+                last_lt_map[pool_addr] = newest_cur
                 save_state()
 
             if not fresh_txs:
                 continue
 
             # oldest -> newest
-            fresh_txs.sort(key=_tx_lt)
+            fresh_txs.sort(key=_cursor)
 
             sym = (rec.get("symbol") or rec.get("ticker") or rec.get("name") or "TOKEN").strip().upper()
             buyer_map = rec.get("buyers")
@@ -1772,12 +1800,18 @@ def dedust_extract_buys_from_tonapi_tx(tx: Dict[str, Any], token_addr: str) -> L
         if not isinstance(a, dict):
             continue
 
-        at = _action_type(a).lower()
+        # TonAPI actions often nest payload under a[type]
+        payload = a.get(a.get('type') or a.get('action') or a.get('name'))
+        aa = dict(a)
+        if isinstance(payload, dict):
+            aa.update(payload)
+
+        at = _action_type(aa).lower()
         if "swap" not in at and "dex" not in at:
             continue
 
         # If TonAPI provides dex metadata, require it to be DeDust.
-        dex = a.get("dex")
+        dex = aa.get("dex")
         dex_name = ""
         if isinstance(dex, dict):
             dex_name = str(dex.get("name") or dex.get("title") or dex.get("id") or "").lower()
@@ -1785,28 +1819,28 @@ def dedust_extract_buys_from_tonapi_tx(tx: Dict[str, Any], token_addr: str) -> L
             continue
 
         buyer = (
-            a.get("user")
-            or a.get("sender")
-            or a.get("initiator")
-            or a.get("from")
-            or a.get("account")
+            aa.get("user")
+            or aa.get("sender")
+            or aa.get("initiator")
+            or aa.get("from")
+            or aa.get("account")
         )
         if isinstance(buyer, dict):
             buyer = buyer.get("address") or buyer.get("account") or buyer.get("wallet")
 
         # Common numeric fields
-        ton_in = a.get("ton_in") or a.get("tonIn") or a.get("in_ton") or a.get("inTon") or a.get("amount_ton_in")
-        jet_out = a.get("jetton_out") or a.get("jettonOut") or a.get("out_jetton") or a.get("outJetton") or a.get("amount_jetton_out")
+        ton_in = aa.get("ton_in") or aa.get("tonIn") or aa.get("in_ton") or aa.get("inTon") or aa.get("amount_ton_in")
+        jet_out = aa.get("jetton_out") or aa.get("jettonOut") or aa.get("out_jetton") or aa.get("outJetton") or aa.get("amount_jetton_out")
 
         # Nested asset shapes
-        asset_in = a.get("assetIn") or a.get("asset_in") or a.get("inAsset") or a.get("in_asset")
-        asset_out = a.get("assetOut") or a.get("asset_out") or a.get("outAsset") or a.get("out_asset")
+        asset_in = aa.get("assetIn") or aa.get("asset_in") or aa.get("inAsset") or aa.get("in_asset")
+        asset_out = aa.get("assetOut") or aa.get("asset_out") or aa.get("outAsset") or aa.get("out_asset")
 
         # Determine out jetton master if present
         out_master = (
-            a.get("jetton_master")
-            or a.get("jettonMaster")
-            or a.get("jetton")
+            aa.get("jetton_master")
+            or aa.get("jettonMaster")
+            or aa.get("jetton")
         )
         if isinstance(out_master, dict):
             out_master = out_master.get("address") or out_master.get("master") or out_master.get("jetton_master")
@@ -1815,8 +1849,8 @@ def dedust_extract_buys_from_tonapi_tx(tx: Dict[str, Any], token_addr: str) -> L
             out_master = extract_jetton_master(asset_out)
 
         # Determine in/out amounts if not in ton_in/jet_out
-        amt_in = a.get("amount_in") or a.get("amountIn") or a.get("in_amount") or a.get("inAmount") or ton_in
-        amt_out = a.get("amount_out") or a.get("amountOut") or a.get("out_amount") or a.get("outAmount") or jet_out
+        amt_in = aa.get("amount_in") or aa.get("amountIn") or aa.get("in_amount") or aa.get("inAmount") or ton_in
+        amt_out = aa.get("amount_out") or aa.get("amountOut") or aa.get("out_amount") or aa.get("outAmount") or jet_out
 
         # Require TON input
         if ton_in is None and not is_ton_asset(asset_in):
