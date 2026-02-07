@@ -1,72 +1,55 @@
 import os
 import json
 import base64
-import time
-from typing import Any, Dict, List, Optional
-
 import requests
+from datetime import datetime
 
+GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
+OWNER = os.getenv("LIVE_REPO_OWNER")
+REPO = os.getenv("LIVE_REPO_NAME")
+PATH = os.getenv("LIVE_FILE_PATH", "data/live.json")
+BRANCH = os.getenv("LIVE_BRANCH", "main")
 
-def _env(name: str, default: str = "") -> str:
-    return (os.getenv(name) or default).strip()
-
-
-def push_live_json(*, leaderboard: List[Dict[str, Any]], buys: List[Dict[str, Any]]) -> None:
-    """
-    Writes `data/live.json` to your GitHub repo using the GitHub Contents API.
-    Safe: if not configured or any error happens, it silently returns.
-
-    Required env vars (Railway):
-      - GITHUB_TOKEN   (classic PAT with repo contents write)
-      - GITHUB_REPO    (e.g. "odegaardquantium-code/Wrb")
-    Optional:
-      - GITHUB_BRANCH  (default: "main")
-      - GITHUB_PATH    (default: "data/live.json")
-    """
-    token = _env("GITHUB_TOKEN")
-    repo = _env("GITHUB_REPO")
-    if not token or not repo or "/" not in repo:
+def push_live_data(leaderboard=None, buys=None):
+    if not GITHUB_TOKEN:
+        print("No GitHub token set")
         return
 
-    branch = _env("GITHUB_BRANCH", "main")
-    path = _env("GITHUB_PATH", "data/live.json")
-
-    # Keep payload small + stable
-    payload = {
-        "ts": int(time.time()),
-        "leaderboard": leaderboard[:10],
-        "buys": buys[:20],
-    }
-    content_bytes = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-    content_b64 = base64.b64encode(content_bytes).decode("ascii")
-
-    api_base = "https://api.github.com"
-    url = f"{api_base}/repos/{repo}/contents/{path}"
+    url = f"https://api.github.com/repos/{OWNER}/{REPO}/contents/{PATH}"
 
     headers = {
-        "Authorization": f"token {token}",
-        "Accept": "application/vnd.github+json",
-        "User-Agent": "SpyTON-live-sync",
+        "Authorization": f"Bearer {GITHUB_TOKEN}",
+        "Accept": "application/vnd.github+json"
     }
 
-    # Get current sha if file exists
-    sha: Optional[str] = None
-    try:
-        r = requests.get(url, headers=headers, params={"ref": branch}, timeout=10)
-        if r.status_code == 200:
-            sha = (r.json() or {}).get("sha")
-    except Exception:
-        sha = None
+    # get current file SHA
+    r = requests.get(url, headers=headers, params={"ref": BRANCH})
+    sha = None
+    if r.status_code == 200:
+        sha = r.json().get("sha")
 
-    body: Dict[str, Any] = {
-        "message": "SpyTON: update live.json",
-        "content": content_b64,
-        "branch": branch,
+    data = {
+        "updated_at": datetime.utcnow().isoformat(),
+        "leaderboard": leaderboard or [],
+        "buys": buys or []
     }
+
+    encoded = base64.b64encode(
+        json.dumps(data, indent=2).encode()
+    ).decode()
+
+    payload = {
+        "message": "Update live data",
+        "content": encoded,
+        "branch": BRANCH
+    }
+
     if sha:
-        body["sha"] = sha
+        payload["sha"] = sha
 
-    try:
-        requests.put(url, headers=headers, json=body, timeout=15)
-    except Exception:
-        return
+    res = requests.put(url, headers=headers, json=payload)
+
+    if res.status_code not in (200, 201):
+        print("GitHub update failed:", res.text)
+    else:
+        print("Live data updated")
