@@ -23,6 +23,16 @@ logging.basicConfig(
 )
 log = logging.getLogger("spyton")
 
+# -------------------- LIVE SITE SYNC (safe) --------------------
+# Keeps Netlify site updated by writing data/live.json to GitHub (never breaks bot).
+LAST_BUYS: List[Dict[str, Any]] = []
+CURRENT_LB: List[Dict[str, Any]] = []
+try:
+    from live_sync import push_live_json  # type: ignore
+except Exception:
+    push_live_json = None  # type: ignore
+
+
 # ============================================================
 # SpyTON Detector
 # - STON.fi buy detection via STON exported events feed (unchanged)
@@ -2278,6 +2288,31 @@ async def post_buy_message(
         except Exception:
             continue
 
+        # Push latest buy + current leaderboard to website (safe, non-blocking)
+        try:
+            dtrade_url_live = f"https://t.me/{DTRADE_BOT_USERNAME}?start={DTRADE_START_PREFIX}{token_addr}" if token_addr else f"https://t.me/{DTRADE_BOT_USERNAME}"
+            buy_item = {
+                "ts": int(time.time()),
+                "symbol": sym,
+                "token_name": (rec.get("token_name") if isinstance(rec, dict) else None) or sym,
+                "token_address": token_addr,
+                "pair_id": pair_id,
+                "dex": (lbl or source_label or "DEX").strip() or "DEX",
+                "ton": float(ton_amt) if isinstance(ton_amt, (int, float)) else 0.0,
+                "amount": float(token_amt) if isinstance(token_amt, (int, float)) else 0.0,
+                "buyer": buyer,
+                "tx_url": tx_url,
+                "chart_url": chart_url,
+                "telegram": tg_url,
+                "dtrade_url": dtrade_url_live,
+            }
+            LAST_BUYS.insert(0, buy_item)
+            del LAST_BUYS[20:]
+            if push_live_json:
+                push_live_json(leaderboard=CURRENT_LB, buys=LAST_BUYS)
+        except Exception:
+            pass
+
     # Background enrichment: fetch stats/holders and edit messages
     if FAST_POST_MODE and sent_refs:
         async def _enrich_and_edit():
@@ -2457,6 +2492,28 @@ async def update_leaderboard(context: ContextTypes.DEFAULT_TYPE):
                 text += "------------------------------\n"
 
     try:
+        # Update website live leaderboard payload (safe)
+        try:
+            new_lb: List[Dict[str, Any]] = []
+            for i, it in enumerate(top):
+                taddr = (DATA.get('pairs', {}).get(it['pair_id'], {}).get('token_address') or '').strip()
+                chart_live = f"https://www.geckoterminal.com/ton/tokens/{taddr}" if taddr else f"https://dexscreener.com/ton/{it['pair_id']}"
+                new_lb.append({
+                    "rank": i + 1,
+                    "symbol": it['sym'],
+                    "change": fmt_pct(it['ch']),
+                    "pair_id": it['pair_id'],
+                    "token_address": taddr,
+                    "telegram": it.get('tg'),
+                    "chart_url": chart_live,
+                })
+            CURRENT_LB.clear()
+            CURRENT_LB.extend(new_lb)
+            if push_live_json:
+                push_live_json(leaderboard=CURRENT_LB, buys=LAST_BUYS)
+        except Exception:
+            pass
+
         await context.bot.edit_message_text(
             chat_id=CHANNEL_ID,
             message_id=int(lb_id),
