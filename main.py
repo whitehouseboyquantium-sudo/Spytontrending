@@ -926,6 +926,56 @@ def ensure_pair_ton_leg(pair_id: str) -> Optional[int]:
         except:
             pass
     return ton_leg
+
+
+def infer_ton_leg_from_event_amounts(a0_in: float, a0_out: float, a1_in: float, a1_out: float) -> Optional[int]:
+    """Best-effort TON leg inference when DexScreener metadata is unavailable.
+
+    STON exported events expose amounts in/out for leg0/leg1.
+    A BUY is TON-in and token-out:
+      - If TON is leg0: amount0In > 0 and amount1Out > 0
+      - If TON is leg1: amount1In > 0 and amount0Out > 0
+
+    When we cannot fetch token symbols (DexScreener down/rate-limited), we infer
+    the TON leg by choosing the candidate whose "TON spent" looks more like a
+    TON amount (bounded, and typically smaller than token output).
+    """
+    cand0 = (a0_in, a1_out) if a0_in > 0 and a1_out > 0 else None
+    cand1 = (a1_in, a0_out) if a1_in > 0 and a0_out > 0 else None
+
+    # If exactly one candidate exists, we can safely infer.
+    if cand0 and not cand1:
+        return 0
+    if cand1 and not cand0:
+        return 1
+    if not cand0 and not cand1:
+        return None
+
+    # If both candidates exist (rare), choose the one that looks like TON spent.
+    # TON spent should not be absurdly large (nanoTON-ish values are handled elsewhere).
+    def score(c: Tuple[float, float]) -> float:
+        ton_spent, token_out = c
+        if ton_spent <= 0 or token_out <= 0:
+            return -1e9
+        # Favor "reasonable" TON spent and big token_out.
+        s = 0.0
+        if ton_spent < 1e6:
+            s += 2.0
+        if ton_spent < 1e4:
+            s += 1.0
+        if token_out > ton_spent:
+            s += 1.0
+        # Penalize implausible ton values
+        if ton_spent > 1e8:
+            s -= 5.0
+        return s
+
+    s0 = score(cand0)
+    s1 = score(cand1)
+    if s0 == s1:
+        return None
+    return 0 if s0 > s1 else 1
+
 def find_pair_for_token_on_dex(token_address: str, want_dex: str) -> Optional[str]:
     url = f"{DEX_TOKEN_URL}/{token_address}"
     try:
@@ -1754,6 +1804,18 @@ def extract_buy_from_ston_event(ev: Dict[str, Any]) -> Optional[Dict[str, Any]]:
 
     # Determine which leg is TON via DexScreener metadata (cached)
     ton_leg = ensure_pair_ton_leg(pair_id)
+    if ton_leg not in (0, 1):
+        # Fallback: infer from event amounts when DexScreener is unavailable.
+        guessed = infer_ton_leg_from_event_amounts(a0_in, a0_out, a1_in, a1_out)
+        if guessed in (0, 1):
+            ton_leg = guessed
+            try:
+                rec = DATA.get("pairs", {}).get(pair_id)
+                if isinstance(rec, dict):
+                    rec["ton_leg"] = int(guessed)
+                    save_data()
+            except Exception:
+                pass
 
     # ✅ BUY ONLY logic:
     # If TON is leg 0 => BUY = amount0In (TON in) and amount1Out (token out)
@@ -2491,6 +2553,7 @@ async def memepad_activation_job(context: ContextTypes.DEFAULT_TYPE):
         return
 
     load_data()
+    load_state()
     watch = DATA.get("watch", {})
     if not isinstance(watch, dict) or not watch:
         return
@@ -2508,6 +2571,22 @@ async def memepad_activation_job(context: ContextTypes.DEFAULT_TYPE):
         source = rec.get("source") or "memepad"
 
         if not token_address:
+            continue
+
+        # If this token is already active in DATA["pairs"], remove the WATCH entry
+        # to avoid repeated "Activated ..." notifications (common when /addtoken is
+        # used multiple times or the same memepad link is processed more than once).
+        already_active = False
+        try:
+            for _pid, _r in (DATA.get("pairs") or {}).items():
+                if isinstance(_r, dict) and (_r.get("token_address") or "").strip() == token_address:
+                    already_active = True
+                    break
+        except Exception:
+            already_active = False
+        if already_active:
+            to_remove.append(watch_id)
+            changed = True
             continue
 
         pair_id = await _to_thread(find_stonfi_ton_pair_for_token, token_address)
@@ -2555,22 +2634,29 @@ async def memepad_activation_job(context: ContextTypes.DEFAULT_TYPE):
         to_remove.append(watch_id)
         changed = True
 
-        try:
-            await context.bot.send_message(
-                chat_id=ADMIN_ID,
-                text=(
-                    f"✅ Activated {symbol}\n"
-                    f"Source: {source}\n"
-                    f"DEX: {dex}\n"
-                    f"Token: <code>{token_address}</code>\n"
-                    f"Pair/Pool: <code>{pair_id}</code>\n"
-                    f"Now posting buys automatically."
-                ),
-                parse_mode="HTML",
-                disable_web_page_preview=True
-            )
-        except Exception:
-            pass
+        # De-dupe activation notifications (stateful)
+        notified = STATE.get("activated_notified", {}) if isinstance(STATE.get("activated_notified"), dict) else {}
+        key = f"{token_address}:{pair_id}"
+        if key not in notified:
+            try:
+                await context.bot.send_message(
+                    chat_id=ADMIN_ID,
+                    text=(
+                        f"✅ Activated {symbol}\n"
+                        f"Source: {source}\n"
+                        f"DEX: {dex}\n"
+                        f"Token: <code>{token_address}</code>\n"
+                        f"Pair/Pool: <code>{pair_id}</code>\n"
+                        f"Now posting buys automatically."
+                    ),
+                    parse_mode="HTML",
+                    disable_web_page_preview=True
+                )
+                notified[key] = int(time.time())
+                STATE["activated_notified"] = notified
+                save_state()
+            except Exception:
+                pass
 
     for k in to_remove:
         watch.pop(k, None)
@@ -3056,6 +3142,44 @@ async def addtoken(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # Token address was provided: try find DEX pair now
+    # If already tracked, just update TG link/symbol and (in groups) set mirror.
+    existing_pair_id = None
+    try:
+        for _pid, _r in (DATA.get("pairs") or {}).items():
+            if isinstance(_r, dict) and (_r.get("token_address") or "").strip() == token_address:
+                existing_pair_id = _pid
+                # refresh metadata
+                if symbol:
+                    _r["symbol"] = symbol
+                if tg_link:
+                    _r["telegram"] = tg_link
+                break
+    except Exception:
+        existing_pair_id = None
+
+    if existing_pair_id:
+        save_data()
+        # If configured inside a group, set/refresh mirror config
+        if chat and chat.type in ("group", "supergroup"):
+            DATA.setdefault("group_mirrors", {})
+            DATA["group_mirrors"][str(chat.id)] = {
+                "symbol": symbol,
+                "token_address": token_address,
+                "pair_id": existing_pair_id,
+                "dex": (DATA.get("pairs", {}).get(existing_pair_id, {}) or {}).get("dex"),
+                "telegram": tg_link,
+                "updated_ts": int(time.time()),
+            }
+            save_data()
+        await update.message.reply_text(
+            f"✅ Already active: <b>{symbol}</b>\n"
+            f"Pair/Pool: <code>{existing_pair_id}</code>\n"
+            f"Posting buys automatically.",
+            parse_mode="HTML",
+            disable_web_page_preview=True,
+        )
+        return
+
     pair_id = find_stonfi_ton_pair_for_token(token_address)
     dex = "stonfi"
     if not pair_id:
@@ -3064,7 +3188,28 @@ async def addtoken(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Not yet on DEX => WATCH (pending)
     if not pair_id:
-        watch_id = f"{source}:{token_address}"
+        # De-dupe: reuse existing WATCH entry for the same token (prevents repeated
+        # memepad activation messages / spam).
+        watch_id = None
+        try:
+            for _wid, _r in (DATA.get("watch") or {}).items():
+                if not isinstance(_r, dict):
+                    continue
+                if (_r.get("token_address") or "").strip() == token_address:
+                    watch_id = _wid
+                    # keep latest fields
+                    _r["symbol"] = symbol or _r.get("symbol")
+                    if tg_link:
+                        _r["telegram"] = tg_link
+                    _r["source"] = source
+                    _r["raw"] = raw_input
+                    _r["blum_slug"] = blum_slug
+                    break
+        except Exception:
+            watch_id = None
+
+        if not watch_id:
+            watch_id = f"{source}:{token_address}"
         DATA.setdefault("watch", {})
         DATA["watch"][watch_id] = {
             "source": source,
@@ -3784,6 +3929,7 @@ def main():
             bot.add_handler(CommandHandler("edittg", edittg))
             bot.add_handler(CommandHandler("delpair", delpair))
             bot.add_handler(CommandHandler("listpairs", listpairs))
+            bot.add_handler(CommandHandler("listpair", listpairs))
             bot.add_handler(CommandHandler("setleaderboard", setleaderboard))
             bot.add_handler(CommandHandler("status", status))
 
